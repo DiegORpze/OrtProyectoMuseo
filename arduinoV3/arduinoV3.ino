@@ -25,14 +25,17 @@ TFT_eSPI tft = TFT_eSPI();
 
 void setup() {
   Serial.begin(115200);
+  delay(1000); // Give time to open serial monitor
+  Serial.println("Booting...");
 
   // Inicializar Pantalla
   tft.init();
-  tft.setRotation(1); // Ajusta la rotación según prefieras (0-3)
+  tft.setRotation(1); // 320x240 landscape
   tft.fillScreen(TFT_BLACK);
   tft.drawString("Iniciando Camara...", 10, 10, 2);
+  tft.setSwapBytes(true); // Important for RGB565 byte order
 
-  // Configuración de la Cámara
+  // Configuración de la Cámara (Must be inside setup!)
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -63,18 +66,17 @@ void setup() {
   config.fb_count = 2; // Double buffer para mayor fluidez
 
   // Inicializar cámara
+  Serial.println("Initializing camera...");
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     tft.fillScreen(TFT_RED);
     tft.drawString("Error en la camara", 10, 10, 2);
-    Serial.printf("Error de cámara: 0x%x", err);
+    Serial.printf("Error de cámara: 0x%x\n", err);
     return;
   }
-  tft.init();
-  tft.setRotation(1);
-  tft.fillScreen(TFT_BLACK);
-  tft.setSwapBytes(true);
-  delay(200);
+  
+  Serial.println("Camera init success!");
+  tft.fillScreen(TFT_BLACK); // Clear text before live video starts
 }
 
 void loop() {

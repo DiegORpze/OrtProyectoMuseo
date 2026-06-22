@@ -7,6 +7,10 @@ void setup() {
   tft.init();
   tft.setRotation(1);
 
+  
+}
+
+void loop() {
   tft.fillScreen(TFT_RED);
   delay(1000);
 
@@ -21,7 +25,4 @@ void setup() {
   tft.setTextColor(TFT_WHITE);
   tft.setTextSize(2);
   tft.drawString("PANTALLA OK", 30, 110);
-}
-
-void loop() {
 }
