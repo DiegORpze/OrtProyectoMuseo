@@ -59,7 +59,7 @@ void setup() {
   
   // Tamaño de la imagen (QVGA es 320x240, ideal para estas pantallas)
   config.frame_size = FRAMESIZE_QVGA;
-  config.jpeg_quality = 10;
+  config.jpeg_quality = 16;
   config.fb_count = 2; // Double buffer para mayor fluidez
 
   // Inicializar cámara
