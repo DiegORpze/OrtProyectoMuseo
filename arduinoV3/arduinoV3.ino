@@ -25,17 +25,26 @@ TFT_eSPI tft = TFT_eSPI();
 
 void setup() {
   Serial.begin(115200);
-  delay(1000); // Give time to open serial monitor
+  delay(1000);
   Serial.println("Booting...");
+
+  // --- MANUAL HARDWARE RESET FOR THE SCREEN ---
+  // This fixes the "hot-plug" issue. It resets the screen cleanly after the ESP32 boots.
+  pinMode(12, OUTPUT);
+  digitalWrite(12, LOW);
+  delay(50);
+  digitalWrite(12, HIGH);
+  delay(150);
+  // ---------------------------------------------
 
   // Inicializar Pantalla
   tft.init();
   tft.setRotation(1); // 320x240 landscape
   tft.fillScreen(TFT_BLACK);
+  tft.setSwapBytes(true); // Fixes RGB color mixing
   tft.drawString("Iniciando Camara...", 10, 10, 2);
-  tft.setSwapBytes(true); // Important for RGB565 byte order
 
-  // Configuración de la Cámara (Must be inside setup!)
+  // Configuración de la Cámara
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -57,15 +66,11 @@ void setup() {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   
-  // IMPORTANTE: Formato RGB565 directo para la pantalla TFT
   config.pixel_format = PIXFORMAT_RGB565; 
-  
-  // Tamaño de la imagen (QVGA es 320x240, ideal para estas pantallas)
   config.frame_size = FRAMESIZE_QVGA;
   config.jpeg_quality = 16;
-  config.fb_count = 2; // Double buffer para mayor fluidez
+  config.fb_count = 1; // MUST BE 1 for RGB565 to prevent memory tearing/waves
 
-  // Inicializar cámara
   Serial.println("Initializing camera...");
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
@@ -76,21 +81,16 @@ void setup() {
   }
   
   Serial.println("Camera init success!");
-  tft.fillScreen(TFT_BLACK); // Clear text before live video starts
+  tft.fillScreen(TFT_BLACK);
 }
 
 void loop() {
-  // Capturar frame de la cámara
   camera_fb_t * fb = esp_camera_fb_get();
   if (!fb) {
     Serial.println("Fallo al capturar el frame");
     return;
   }
 
-  // Dibujar directamente el buffer de la cámara en la pantalla TFT
-  // Como el formato es RGB565, coincide con los píxeles de la pantalla
   tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
-
-  // Liberar el buffer para la siguiente captura
   esp_camera_fb_return(fb);
 }
