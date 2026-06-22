@@ -29,7 +29,6 @@ void setup() {
   Serial.println("Booting...");
 
   // --- MANUAL HARDWARE RESET FOR THE SCREEN ---
-  // This fixes the "hot-plug" issue. It resets the screen cleanly after the ESP32 boots.
   pinMode(12, OUTPUT);
   digitalWrite(12, LOW);
   delay(50);
@@ -37,14 +36,12 @@ void setup() {
   delay(150);
   // ---------------------------------------------
 
-  // Inicializar Pantalla
   tft.init();
-  tft.setRotation(1); // 320x240 landscape
+  tft.setRotation(1); 
   tft.fillScreen(TFT_BLACK);
-  tft.setSwapBytes(true); // Fixes RGB color mixing
+  tft.setSwapBytes(true); 
   tft.drawString("Iniciando Camara...", 10, 10, 2);
 
-  // Configuración de la Cámara
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -69,7 +66,7 @@ void setup() {
   config.pixel_format = PIXFORMAT_RGB565; 
   config.frame_size = FRAMESIZE_QVGA;
   config.jpeg_quality = 16;
-  config.fb_count = 1; // MUST BE 1 for RGB565 to prevent memory tearing/waves
+  config.fb_count = 1;
 
   Serial.println("Initializing camera...");
   esp_err_t err = esp_camera_init(&config);
@@ -90,6 +87,11 @@ void loop() {
     Serial.println("Fallo al capturar el frame");
     return;
   }
+
+  // --- DIAGNOSTIC PRINT ---
+  // 2 = JPEG, 4 = RGB565, 5 = YUV422
+  // This will print continuously. We just need to see it once.
+  Serial.printf("Format: %d | W: %d | H: %d\n", fb->format, fb->width, fb->height);
 
   tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
   esp_camera_fb_return(fb);
