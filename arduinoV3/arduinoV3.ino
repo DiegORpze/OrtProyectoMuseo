@@ -70,8 +70,11 @@ void setup() {
     Serial.printf("Error de cámara: 0x%x", err);
     return;
   }
-
+  tft.init();
+  tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
+  tft.setSwapBytes(true);
+  delay(200);
 }
 
 void loop() {
