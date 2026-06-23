@@ -22,7 +22,7 @@
 TFT_eSPI tft = TFT_eSPI();
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(230400);
   delay(1000);
 
   // Manual reset
@@ -33,7 +33,7 @@ void setup() {
   delay(150);
 
   tft.init();
-  tft.setRotation(1); 
+  tft.setRotation(2); 
   tft.fillScreen(TFT_BLACK);
 
   // --- SCREEN DRIVER TEST ---
@@ -78,7 +78,7 @@ void setup() {
   
   config.pixel_format = PIXFORMAT_RGB565; 
   config.frame_size = FRAMESIZE_QVGA;
-  config.fb_count = 1;
+  config.fb_count = 2;
 
   Serial.println("Initializing camera...");
   esp_err_t err = esp_camera_init(&config);
