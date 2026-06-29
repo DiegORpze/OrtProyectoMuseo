@@ -1,9 +1,3 @@
-#include <quirc.h>
-#include <quirc_internal.h>
-
-#include <quirc.h>
-#include <quirc_internal.h>
-
 #include "esp_camera.h"
 #include <SPI.h>
 #include <TFT_eSPI.h>
@@ -31,8 +25,11 @@ TFT_eSPI tft = TFT_eSPI();
 struct quirc *qr = nullptr;
 int frame_counter = 0;
 
+// Allocate grayscale buffer globally so we don't use malloc in the loop (prevents waves/stutter)
+uint8_t *grayscale_buf = nullptr; 
+
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(230400);
   delay(1000);
 
   // Manual reset
@@ -45,14 +42,19 @@ void setup() {
   tft.init();
   tft.setRotation(2); 
   tft.fillScreen(TFT_BLACK);
-  tft.setSwapBytes(true); 
+  tft.setSwapBytes(false); 
+
+  // Allocate memory for QR scanner ONCE
+  grayscale_buf = (uint8_t *)malloc(320 * 240);
+  if (!grayscale_buf) {
+    Serial.println("Failed to allocate grayscale buffer");
+  }
 
   // Initialize QR Decoder
   qr = quirc_new();
   if (!qr) {
     Serial.println("Failed to allocate quirc memory");
   } else {
-    // QVGA is 320x240
     if (quirc_resize(qr, 320, 240) < 0) {
       Serial.println("Failed to resize quirc");
     }
@@ -77,10 +79,12 @@ void setup() {
   config.pin_pclk = PCLK_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 16000000; 
+  config.xclk_freq_hz = 20000000; 
   config.pixel_format = PIXFORMAT_RGB565; 
   config.frame_size = FRAMESIZE_QVGA;
-  config.fb_count = 2;
+  
+  // MUST BE 2 to prevent tearing/waves
+  config.fb_count = 2; 
   config.grab_mode = CAMERA_GRAB_LATEST;
 
   Serial.println("Initializing camera...");
@@ -97,10 +101,10 @@ void loop() {
   camera_fb_t * fb = esp_camera_fb_get();
   if (!fb) return;
 
-  // 1. Draw the live video to the screen first (keeps VR feeling smooth)
+  // 1. Draw the live video to the screen first
   tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
 
-  // 2. Only scan for QR codes every 15 frames to prevent video stutter
+  // 2. Only scan for QR codes every 15 frames
   frame_counter++;
   if (frame_counter >= 15) {
     frame_counter = 0;
@@ -111,10 +115,7 @@ void loop() {
 }
 
 void scanQRCode(camera_fb_t *fb) {
-  if (!qr) return;
-
-  uint8_t *grayscale_buf = (uint8_t *)malloc(320 * 240);
-  if (!grayscale_buf) return;
+  if (!qr || !grayscale_buf) return;
 
   // RGB565 to Grayscale conversion
   for (int i = 0; i < 320 * 240; i++) {
@@ -127,14 +128,11 @@ void scanQRCode(camera_fb_t *fb) {
 
   // Feed image to quirc
   int w = 0, h = 0;
-  // quirc_begin returns the pointer to the internal buffer we need to write to
   uint8_t *qbuf = quirc_begin(qr, &w, &h);
   
   if (qbuf) {
-    // Copy our grayscale data into quirc's buffer
     memcpy(qbuf, grayscale_buf, w * h);
   }
-  // Tell quirc we are done writing the image and it can start decoding
   quirc_end(qr);
 
   // Check for QR codes
@@ -179,6 +177,5 @@ void scanQRCode(camera_fb_t *fb) {
       }
     }
   }
-
-  free(grayscale_buf);
+  // NO MORE free() HERE, buffer is global now
 }
