@@ -32,6 +32,7 @@ uint8_t *grayscale_buf = nullptr;
 volatile bool update_ui = false;
 char new_payload[64] = "";
 String last_painting_name = "";
+String current_painting_text = ""; 
 
 // Task handle for Core 0
 TaskHandle_t Task0;
@@ -52,7 +53,7 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   tft.setSwapBytes(false); 
 
-  // Allocate memory safely (try PSRAM first, fall back to normal RAM)
+  // Allocate memory safely
   if(ESP.getPsramSize() > 0) {
     grayscale_buf = (uint8_t *)ps_malloc(320 * 240);
   } else {
@@ -109,13 +110,13 @@ void setup() {
 
   // Start Core 0 task
   xTaskCreatePinnedToCore(
-    scannerTask,   // Task function
-    "Scanner",     // Name
-    10000,         // Stack size (large for quirc)
-    NULL,          // Parameters
-    1,             // Priority
-    &Task0,        // Task handle
-    0              // Pin to Core 0
+    scannerTask,   
+    "Scanner",     
+    10000,         
+    NULL,          
+    1,             
+    &Task0,        
+    0              
   );
 }
 
@@ -131,40 +132,49 @@ void loop() {
   if (!frame_ready_for_scan && grayscale_buf) {
     for (int i = 0; i < 320 * 240; i++) {
       uint16_t pixel = (fb->buf[i*2] << 8) | fb->buf[i*2+1]; 
+      
+      // Extract R, G, B
       uint8_t r = (pixel >> 11) & 0x1F;
       uint8_t g = (pixel >> 5) & 0x3F;
       uint8_t b = pixel & 0x1F;
-      grayscale_buf[i] = (r * 77 + g * 150 + b * 29) >> 3; 
+      
+      // FIX: Properly scale 5-bit/6-bit values to 8-bit (0-255) before applying luminance formula
+      r = (r << 3) | (r >> 2);
+      g = (g << 2) | (g >> 4);
+      b = (b << 3) | (b >> 2);
+      
+      // Standard luminance formula (Y = 0.299R + 0.587G + 0.114B)
+      grayscale_buf[i] = (r * 77 + g * 150 + b * 29) >> 8; 
     }
     frame_ready_for_scan = true;
   }
 
-  // 3. If Core 0 successfully read a QR code, draw it on the screen HERE (Prevents SPI crash)
+  // 3. If Core 0 successfully read a NEW QR code, update our text variable
   if (update_ui) {
     update_ui = false; // Clear flag
     String payload = String(new_payload);
     
-    // Debug: Print raw text at the top of the screen so you know it scanned!
-    tft.fillRect(0, 0, 240, 20, TFT_WHITE);
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
-    tft.drawString("Read: " + payload, 2, 2, 2);
-
     // --- MUSEUM LOGIC HERE ---
     if (payload == "MonaLisa") {
-      tft.fillRect(0, 210, 240, 30, TFT_BLUE);
-      tft.setTextColor(TFT_WHITE, TFT_BLUE);
-      tft.drawString("Painting: Mona Lisa", 5, 215, 2);
+      current_painting_text = "Painting: Mona Lisa";
     }
     else if (payload == "StarryNight") {
-      tft.fillRect(0, 210, 240, 30, TFT_RED);
-      tft.setTextColor(TFT_WHITE, TFT_RED);
-      tft.drawString("Painting: Starry Night", 5, 215, 2);
+      current_painting_text = "Painting: Starry Night";
     }
     else if (payload == "TheScream") {
-      tft.fillRect(0, 210, 240, 30, TFT_GREEN);
-      tft.setTextColor(TFT_BLACK, TFT_GREEN);
-      tft.drawString("Painting: The Scream", 5, 215, 2);
+      current_painting_text = "Painting: The Scream";
     }
+    else {
+      // If it reads a QR code you didn't program, show the raw text
+      current_painting_text = "Read: " + payload;
+    }
+  }
+
+  // 4. Draw the text box EVERY FRAME so the video doesn't erase it
+  if (current_painting_text != "") {
+    tft.fillRect(0, 210, 240, 30, TFT_BLUE); // Background box
+    tft.setTextColor(TFT_WHITE, TFT_BLUE);
+    tft.drawString(current_painting_text, 5, 215, 2);
   }
 
   esp_camera_fb_return(fb);
@@ -191,12 +201,15 @@ void scannerTask(void *pvParameters) {
         quirc_extract(qr, 0, &code);
         
         if (quirc_decode(&code, &data) == QUIRC_SUCCESS) {
-          // Copy the text to the shared variable
-          strncpy(new_payload, (const char *)data.payload, 63);
-          new_payload[63] = '\0'; // Ensure null-terminated
+          String payload = String((const char *)data.payload);
           
-          // Tell Core 1 to update the screen
-          update_ui = true; 
+          // Only trigger a UI update if it's a different QR code than last time
+          if (payload != last_painting_name) {
+            last_painting_name = payload;
+            strncpy(new_payload, (const char *)data.payload, 63);
+            new_payload[63] = '\0'; 
+            update_ui = true; 
+          }
         }
       }
       // Tell Core 1 we are done and ready for the next frame
