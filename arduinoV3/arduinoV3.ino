@@ -32,7 +32,7 @@ char qr_payload[64] = "";
 
 // Core 1 → Core 0
 volatile bool frame_ready_for_scan = false;
-volatile bool allow_scan = true; // set false during result display
+volatile bool allow_scan = true;
 
 const unsigned long RESULT_DURATION_MS = 5000;
 
@@ -111,11 +111,12 @@ void setup() {
   Serial.println("Ready");
 }
 
+// Museum logic: map QR payload to painting name
 const char *lookupPainting(const char *payload) {
   if (strcmp(payload, "MonaLisa") == 0)    return "Mona Lisa";
   if (strcmp(payload, "StarryNight") == 0)  return "Starry Night";
   if (strcmp(payload, "TheScream") == 0)    return "The Scream";
-  return nullptr;
+  return nullptr; // unknown QR
 }
 
 void drawResultScreen(const char *painting_name, bool known) {
@@ -131,7 +132,7 @@ void drawResultScreen(const char *painting_name, bool known) {
 }
 
 void drainCameraBuffers() {
-  for (int i = 0; i < 3; i++) {
+  for (int i = 0; i < 5; i++) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb) esp_camera_fb_return(fb);
   }
@@ -141,32 +142,43 @@ void drainCameraBuffers() {
 void loop() {
   unsigned long now = millis();
 
-  // ---- RESULT STATE: ONLY entered when QR is detected ----
+  // ---- RESULT STATE: entered only when QR is detected ----
   if (qr_found) {
-    // Step 1: Turn off screen
+    // 1. Turn screen off
     tft.fillScreen(TFT_BLACK);
 
-    // Step 2: Drain all camera buffers to free memory
+    // 2. Drain camera buffers multiple times to fully empty the DMA pipeline
+    drainCameraBuffers();
     drainCameraBuffers();
 
-    // Step 3: Clear the QR flag so loop can resume normally after
+    // 3. Small pause to let camera hardware fully settle after draining
+    delay(100);
+
+    // 4. Drain again — just to be sure
+    drainCameraBuffers();
+
+    // 5. Clear QR flag so this block doesn't re-enter
     qr_found = false;
 
-    // Step 4: Display the result text on black screen
+    // 6. Draw the painting name from museum logic
     const char *name = lookupPainting(qr_payload);
-    drawResultScreen(name ? name : qr_payload, name != nullptr);
+    if (name) {
+      drawResultScreen(name, true);
+    } else {
+      drawResultScreen(qr_payload, false);
+    }
 
-    // Wait for the display duration
+    // 7. Wait for result display duration
     delay(RESULT_DURATION_MS);
 
-    // Step 5: Empty everything and start from zero
+    // 8. Empty everything and return to live video
     memset(qr_payload, 0, 64);
     allow_scan = true;
     frame_counter = 0;
     frame_ready_for_scan = false;
     tft.fillScreen(TFT_BLACK);
 
-    // Drain any stray frames that came in during result display
+    // Drain any frames that arrived during result display
     drainCameraBuffers();
 
     return;
@@ -176,7 +188,6 @@ void loop() {
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
 
-  // Display frame immediately
   tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
 
   // Feed grayscale to Core 0 every N frames
@@ -204,13 +215,11 @@ void loop() {
 // ------------------- CORE 0: QR SCANNER -------------------
 void scannerTask(void *pvParameters) {
   for (;;) {
-    // Block until Core 1 gives us a frame
     if (!frame_ready_for_scan) {
       vTaskDelay(5 / portTICK_PERIOD_MS);
       continue;
     }
 
-    // Skip scanning if we're in result display mode
     if (!allow_scan) {
       frame_ready_for_scan = false;
       vTaskDelay(5 / portTICK_PERIOD_MS);
@@ -242,7 +251,7 @@ void scannerTask(void *pvParameters) {
         strncpy(qr_payload, tmp, 63);
         qr_payload[63] = '\0';
         qr_found = true;
-        allow_scan = false; // stop scanning during result display
+        allow_scan = false;
         Serial.print("QR: ");
         Serial.println(qr_payload);
       }
