@@ -39,6 +39,8 @@ int frame_counter = 0;
 
 TaskHandle_t Task0;
 
+void setupCamera();
+
 void setup() {
   Serial.begin(230400);
   delay(1000);
@@ -71,6 +73,13 @@ void setup() {
     quirc_resize(qr, 320, 240);
   }
 
+  setupCamera();
+
+  xTaskCreatePinnedToCore(scannerTask, "Scanner", 10000, NULL, 1, &Task0, 0);
+  Serial.println("Ready");
+}
+
+void setupCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -102,11 +111,7 @@ void setup() {
     tft.fillScreen(TFT_RED);
     tft.drawString("Cam Error", 10, 10, 2);
     Serial.printf("Error: 0x%x\n", err);
-    return;
   }
-
-  xTaskCreatePinnedToCore(scannerTask, "Scanner", 10000, NULL, 1, &Task0, 0);
-  Serial.println("Ready");
 }
 
 const char *getPaintingPrompt(const char *payload) {
@@ -126,7 +131,7 @@ void showResult(const char *prompt) {
 }
 
 void drainCameraBuffers() {
-  for (int i = 0; i < 8; i++) {
+  for (int i = 0; i < 5; i++) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb) esp_camera_fb_return(fb);
   }
@@ -135,21 +140,18 @@ void drainCameraBuffers() {
 // ------------------- CORE 1: VIDEO LOOP -------------------
 void loop() {
   if (qr_found) {
+    qr_found = false;
+
     // 1. Screen off
     tft.fillScreen(TFT_BLACK);
 
-    // 2. Drain camera completely
+    // 2. Brief drain to clear current buffers
     drainCameraBuffers();
 
-    // 3. Give camera hardware time to fully settle
-    delay(200);
+    // 3. Deinit camera — completely resets DMA and buffer pool
+    esp_camera_deinit();
 
-    // 4. Drain again after settling
-    drainCameraBuffers();
-
-    // 5. Clear QR flag and draw result
-    qr_found = false;
-
+    // 4. Draw result on clean screen
     const char *prompt = getPaintingPrompt(qr_payload);
     if (prompt) {
       showResult(prompt);
@@ -157,27 +159,20 @@ void loop() {
       showResult(qr_payload);
     }
 
-    // 6. Wait for result duration
+    // 5. Wait for result duration
     delay(RESULT_DURATION_MS);
 
-    // 7. Screen off again before returning to video
+    // 6. Screen off before resuming
     tft.fillScreen(TFT_BLACK);
 
-    // 8. Aggressively drain all buffered frames
-    drainCameraBuffers();
-    drainCameraBuffers();
-    delay(300);   // let camera DMA fully flush
-    drainCameraBuffers();
-    drainCameraBuffers();
+    // 7. Reinit camera — fresh DMA state, empty buffer pool
+    setupCamera();
 
-    // 9. Reset everything
+    // 8. Reset state
     memset(qr_payload, 0, 64);
     allow_scan = true;
     frame_counter = 0;
     frame_ready_for_scan = false;
-
-    // 10. One more drain before resuming
-    drainCameraBuffers();
 
     return;
   }
