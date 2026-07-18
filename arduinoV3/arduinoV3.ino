@@ -2,7 +2,6 @@
 #include <SPI.h>
 #include <TFT_eSPI.h>
 #include <quirc.h>
-#include <semphr.h>
 
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
@@ -23,15 +22,15 @@
 
 TFT_eSPI tft = TFT_eSPI();
 
-// PSRAM buffer for grayscale scan data
-static uint8_t *scan_buf = nullptr;
+// Internal DRAM buffer for grayscale conversion — avoids PSRAM cache thrashing
+static uint8_t scan_buf[320 * 240];
 
 struct quirc *qr = nullptr;
 
-// Binary semaphore: Core 1 gives → Core 0 takes
-static SemaphoreHandle_t frame_sem = nullptr;
+// Notification flag: Core 1 writes, Core 0 reads once then clears
+static volatile bool frame_available = false;
 
-// Shared result data
+// QR result: Core 0 writes, Core 1 reads once then clears
 static volatile bool qr_detected = false;
 static char qr_payload[64] = "";
 static String last_qr_payload = "";
@@ -39,15 +38,13 @@ static unsigned long last_qr_time = 0;
 static const unsigned long QR_COOLDOWN_MS = 3000;
 static const unsigned long RESULT_DURATION_MS = 4000;
 
-// Result overlay state
 static bool showing_result = false;
 static unsigned long result_until = 0;
 
-// Scan throttle: only convert + scan every N frames
+// Only scan every N video frames so camera DMA has time to breathe
 static const int FRAMES_BETWEEN_SCANS = 30;
 static int frame_counter = 0;
 
-// Task handle for Core 0
 static TaskHandle_t scanner_task = nullptr;
 
 const char *lookupPainting(const char *payload) {
@@ -84,22 +81,11 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   tft.setSwapBytes(false);
 
-  scan_buf = (uint8_t *)ps_malloc(320 * 240);
-  if (!scan_buf) {
-    Serial.println("scan_buf alloc failed!");
-  }
-
   qr = quirc_new();
   if (!qr) {
     Serial.println("quirc alloc failed!");
   } else {
     quirc_resize(qr, 320, 240);
-  }
-
-  // Binary semaphore for frame delivery (Core 1 → Core 0)
-  frame_sem = xSemaphoreCreateBinary();
-  if (!frame_sem) {
-    Serial.println("semaphore failed!");
   }
 
   camera_config_t config;
@@ -149,20 +135,21 @@ void setup() {
 }
 
 // ================================================================
-// CORE 1 — Video + UI loop
+// CORE 1 — Display + camera loop
 //
-// Strict ordering per frame:
+// Strict ordering:
 //   1. esp_camera_fb_get()     → get frame
-//   2. pushImage()              → display it (fully completes)
-//   3. esp_camera_fb_return()   → give buffer back to camera
-//   4. (on throttle): convert + give semaphore to Core 0
+//   2. pushImage()              → display (blocking SPI transfer)
+//   3. esp_camera_fb_return()  → return buffer to camera
 //
-// The camera buffer is NEVER held during any scan or display work.
+// Grayscale conversion runs on a THROTTLED frame (every N frames).
+// Camera buffer is ALWAYS returned before any scan work starts.
+//
 // ================================================================
 void loop() {
   unsigned long now = millis();
 
-  // ---- RESULT STATE: wait out the timeout, drain camera buffers ----
+  // ---- RESULT STATE: wait out the timeout, drain camera frames ----
   if (showing_result) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb) esp_camera_fb_return(fb);
@@ -179,24 +166,22 @@ void loop() {
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
 
-  // Display frame — this is the only display operation.
-  // pushImage blocks until the entire frame is transferred over SPI.
+  // Display frame. This blocks until the SPI transfer is fully done.
+  // After this returns, the display HW has the complete frame.
   tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
 
-  // Return the camera buffer IMMEDIATELY after pushImage.
-  // The camera can now reuse/recycle this buffer for the next capture.
+  // Return camera buffer IMMEDIATELY — before any other work.
+  // This is the most important line: camera DMA is never blocked.
   esp_camera_fb_return(fb);
   fb = nullptr;
 
   // ---- THROTTLED SCAN: only convert a frame every N video frames ----
-  // This prevents scan work from stealing CPU time from video display.
   frame_counter++;
   if (frame_counter >= FRAMES_BETWEEN_SCANS) {
     frame_counter = 0;
 
-    // Convert RGB565 → grayscale into scan_buf
-    // We read from the frame we already displayed (fb was returned above).
-    // This conversion is independent of the camera — camera is already free.
+    // Grab a fresh frame for scanning (camera is healthy because we
+    // returned the previous buffer immediately)
     camera_fb_t *tmp = esp_camera_fb_get();
     if (tmp) {
       uint8_t *src = tmp->buf;
@@ -213,10 +198,8 @@ void loop() {
       esp_camera_fb_return(tmp);
     }
 
-    // Signal Core 0 to run QR detection on the grayscale buffer
-    if (frame_sem) {
-      xSemaphoreGive(frame_sem);
-    }
+    // Tell Core 0 a frame is ready
+    frame_available = true;
   }
 
   // ---- CHECK FOR QR RESULT FROM CORE 0 ----
@@ -244,19 +227,22 @@ void loop() {
 // ================================================================
 // CORE 0 — QR scanner task
 //
-// Waits on a semaphore before processing each frame.
-// Runs grayscale → quirc decode, then signals Core 1 via qr_detected.
-// Completely decoupled from camera and display — only touches scan_buf.
+// Waits for frame_available flag, then runs quirc decode.
+// Completely decoupled from camera and display DMA.
+// Only reads from scan_buf (internal DRAM) — no bus contention.
+//
 // ================================================================
 void scannerTask(void *pvParameters) {
   for (;;) {
-    // Wait for Core 1 to give us a frame to process
-    if (frame_sem) {
-      BaseType_t got = xSemaphoreTake(frame_sem, portMAX_DELAY);
-      if (got != pdTRUE) continue;
+    // Wait for a frame to be available
+    if (!frame_available) {
+      vTaskDelay(5 / portTICK_PERIOD_MS);
+      continue;
     }
 
-    // QR detection on scan_buf (which is in PSRAM, independent of camera)
+    frame_available = false;
+
+    // QR detection on scan_buf (internal DRAM, no PSRAM contention)
     int w = 0, h = 0;
     uint8_t *qbuf = quirc_begin(qr, &w, &h);
     if (qbuf) {
@@ -274,7 +260,6 @@ void scannerTask(void *pvParameters) {
         char tmp[64];
         memcpy(tmp, data.payload, len);
         tmp[len] = '\0';
-        // Strip trailing control characters
         for (int i = 0; i < len; i++) {
           if (tmp[i] < 32) { tmp[i] = '\0'; break; }
         }
