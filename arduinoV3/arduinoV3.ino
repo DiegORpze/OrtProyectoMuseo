@@ -24,30 +24,28 @@ TFT_eSPI tft = TFT_eSPI();
 
 struct quirc *qr = nullptr;
 
-// Our own private pixel buffer — the camera frame is copied here
-// immediately after we get it, then the camera buffer is returned.
-// This decouples the camera DMA from our QR processing.
-static uint16_t pixel_buf[320 * 240];  // 153,600 bytes — fits in PSRAM
-static bool pixel_buf_valid = false;
+// ALL large buffers go in PSRAM — DRAM is precious on ESP32
+static uint8_t *pixel_buf = nullptr;    // RGB565 frame copy  — 153,600 bytes
+static uint8_t *grayscale_buf = nullptr; // Grayscale for quirc —  76,800 bytes
 
-// QR result
-bool qr_found = false;
+// Shared flags between cores (volatile for cross-core visibility)
+volatile bool frame_copy_ready = false;  // Core 1 sets, Core 0 clears
+volatile bool qr_detected = false;       // Core 0 sets, Core 1 clears
 char qr_payload[64] = "";
 
-// State machine
-enum DisplayState { LIVE_STREAMING, SHOWING_RESULT };
-DisplayState state = LIVE_STREAMING;
+// Result display
+bool showing_result = false;
 unsigned long result_until = 0;
 const unsigned long RESULT_DURATION_MS = 4000;
-
-// Scan every N frames to give the camera buffer pool time to breathe
-const int FRAMES_BETWEEN_SCANS = 20;
-int frame_counter = 0;
-
-// Debounce
 String last_qr_payload = "";
 unsigned long last_qr_time = 0;
 const unsigned long QR_COOLDOWN_MS = 3000;
+
+// QR scan runs every N frames to avoid blocking camera DMA
+const int FRAMES_BETWEEN_SCANS = 30; // ~1 second at 30fps
+int frame_counter = 0;
+
+TaskHandle_t Task0;
 
 void setup() {
   Serial.begin(230400);
@@ -64,7 +62,14 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   tft.setSwapBytes(false);
 
-  // QR decoder
+  // Allocate buffers in PSRAM (outside limited DRAM)
+  pixel_buf = (uint8_t *)ps_malloc(320 * 240 * 2);
+  grayscale_buf = (uint8_t *)ps_malloc(320 * 240);
+
+  if (!pixel_buf || !grayscale_buf) {
+    Serial.println("PSRAM allocation failed!");
+  }
+
   qr = quirc_new();
   if (!qr) {
     Serial.println("Failed to allocate quirc!");
@@ -106,6 +111,10 @@ void setup() {
     return;
   }
 
+  xTaskCreatePinnedToCore(
+    scannerTask, "Scanner", 10000, NULL, 1, &Task0, 0
+  );
+
   Serial.println("Ready");
 }
 
@@ -116,136 +125,150 @@ const char *lookupPainting(const char *payload) {
   return nullptr;
 }
 
-// Fast DMA-assisted pixel copy + grayscale conversion.
-// Copies pixel_buf (RGB565) to grayscale_buf (quirc input).
-// DMA can only do memory-to-memory copies; conversion is still sequential
-// but we run it from IRAM so it isn't interrupted by cache misses.
-static uint8_t grayscale_buf[320 * 240];
-static DRAM_ATTR bool conversion_done = false;
+// Draw result as an OVERLAY on top of live video — video keeps playing underneath
+void drawResultOverlay(const char *painting_name, bool known) {
+  // Semi-transparent dark box at bottom of screen
+  tft.fillRect(0, 194, 320, 46, TFT_DARKGREY);
+  tft.fillRect(0, 197, 320, 40, TFT_BLUE);
 
-void convertFrameToGrayscale() {
-  // Convert in small batches to avoid blocking other tasks too long
-  for (int i = 0; i < 320 * 240; i++) {
-    uint16_t pixel = pixel_buf[i];
-    uint8_t r5 = (pixel >> 11) & 0x1F;
-    uint8_t g6 = (pixel >> 5)  & 0x3F;
-    uint8_t b5 =  pixel        & 0x1F;
-    uint8_t r = (r5 << 3) | (r5 >> 2);
-    uint8_t g = (g6 << 2) | (g6 >> 4);
-    uint8_t b = (b5 << 3) | (b5 >> 2);
-    grayscale_buf[i] = (r * 77 + g * 150 + b * 29) >> 8;
-  }
-  conversion_done = true;
-}
+  tft.setTextColor(TFT_WHITE, TFT_BLUE);
+  tft.drawString(painting_name, 5, 200, 2);
 
-bool runQRDetection() {
-  if (!qr || !conversion_done) return false;
+  tft.setTextColor(known ? TFT_GREEN : TFT_YELLOW, TFT_BLUE);
+  tft.drawString(known ? "Painting Identified" : "Unknown QR", 5, 218, 1);
 
-  int w = 0, h = 0;
-  uint8_t *qbuf = quirc_begin(qr, &w, &h);
-  memcpy(qbuf, grayscale_buf, w * h);
-  quirc_end(qr);
-
-  if (quirc_count(qr) == 0) return false;
-
-  struct quirc_code code;
-  struct quirc_data data;
-  quirc_extract(qr, 0, &code);
-  if (quirc_decode(&code, &data) != QUIRC_SUCCESS) return false;
-
-  int len = data.payload_len;
-  if (len > 63) len = 63;
-  char tmp[64];
-  memcpy(tmp, data.payload, len);
-  tmp[len] = '\0';
-
-  // Strip trailing whitespace
-  for (int i = 0; i < len; i++) {
-    if (tmp[i] == ' ' || tmp[i] == '\n' || tmp[i] == '\r' || tmp[i] == '\t') {
-      tmp[i] = '\0';
-      break;
-    }
-  }
-
-  Serial.print("QR: ");
-  Serial.println(tmp);
-
+  // Progress bar
   unsigned long now = millis();
-  if (strcmp(tmp, last_qr_payload.c_str()) == 0 &&
-      (now - last_qr_time) < QR_COOLDOWN_MS) {
-    return false;
-  }
-
-  last_qr_payload = String(tmp);
-  last_qr_time = now;
-
-  const char *name = lookupPainting(tmp);
-  strncpy(qr_payload, name ? name : tmp, 63);
-  qr_payload[63] = '\0';
-  qr_found = true;
-  return true;
+  unsigned long elapsed = now - (result_until - RESULT_DURATION_MS);
+  uint16_t barW = map(elapsed, 0, RESULT_DURATION_MS, 0, 316);
+  tft.drawRect(2, 234, 316, 3, TFT_WHITE);
+  tft.fillRect(2, 234, barW, 3, TFT_GREEN);
 }
 
-void drawResultScreen(const char *painting_name, bool known) {
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString(painting_name, 160, 85, 4);
-  tft.setTextColor(known ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
-  tft.drawString(known ? "Painting Identified" : "Unknown QR Code", 160, 130, 2);
-  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.drawString("Returning to live video...", 160, 190, 2);
-  tft.setTextDatum(TL_DATUM);
-}
-
-// ---------------------------------------------------------------------------
+// ============================================================
+// CORE 1: Video loop — capture, display, feed scanner periodically
+// ============================================================
 void loop() {
   unsigned long now = millis();
 
-  // ---- RESULT DISPLAY MODE ----
-  if (state == SHOWING_RESULT) {
-    if (now >= result_until) {
-      state = LIVE_STREAMING;
-      pixel_buf_valid = false;
-      tft.fillScreen(TFT_BLACK);
-    }
-    return;
+  // --- Result overlay timeout: just clear the overlay region ---
+  if (showing_result && now >= result_until) {
+    showing_result = false;
+    last_qr_payload = "";
+    // Redraw a clean video frame region (overlay area gets covered by video)
+    tft.fillRect(0, 194, 320, 46, TFT_BLACK);
   }
 
-  // ---- LIVE STREAMING ----
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
 
-  // 1. Display the frame immediately
+  // 1. Push frame to display immediately
   tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
 
-  // 2. Copy pixel data to our private buffer RIGHT AWAY,
-  //    then return the camera frame so DMA is never blocked.
-  //    The copy is fast (~5-10ms with word-aligned access).
-  if (!pixel_buf_valid) {
+  // 2. Every N frames: copy pixel data to PSRAM buffer for Core 0 to scan.
+  //    We copy BEFORE returning the frame so we know the data is valid.
+  //    The copy takes ~1-2ms and is a simple DMA memcpy — does not block.
+  frame_counter++;
+  if (frame_counter >= FRAMES_BETWEEN_SCANS && !frame_copy_ready) {
+    frame_counter = 0;
     memcpy(pixel_buf, fb->buf, 320 * 240 * 2);
-    pixel_buf_valid = true;
-    conversion_done = false;   // grayscale conversion still pending
+    frame_copy_ready = true;
   }
 
-  // 3. Return camera frame immediately — camera DMA can resume
+  // 3. Return frame immediately — camera DMA can recycle this buffer
   esp_camera_fb_return(fb);
 
-  // 4. Periodic QR scan — now runs on our own pixel_buf copy,
-  //    completely decoupled from camera DMA and display SPI.
-  frame_counter++;
-  if (frame_counter >= FRAMES_BETWEEN_SCANS) {
-    frame_counter = 0;
+  // 4. If Core 0 found a QR, draw the overlay
+  if (qr_detected) {
+    qr_detected = false;
 
-    // Grayscale conversion (runs on our private copy — no bus contention)
-    convertFrameToGrayscale();
+    unsigned long elapsed = now - last_qr_time;
+    if (strcmp(qr_payload, last_qr_payload.c_str()) != 0 ||
+        elapsed >= QR_COOLDOWN_MS) {
 
-    // QR detection
-    if (runQRDetection()) {
-      drawResultScreen(qr_payload, true);
-      state = SHOWING_RESULT;
+      last_qr_payload = String(qr_payload);
+      last_qr_time = now;
+
+      const char *name = lookupPainting(qr_payload);
+      drawResultOverlay(name ? name : qr_payload, name != nullptr);
+
+      showing_result = true;
       result_until = now + RESULT_DURATION_MS;
-      pixel_buf_valid = false;   // clear so next video frame is fresh
+    }
+  }
+
+  // 5. If showing result overlay, redraw it every frame
+  //    (pushImage above overwrites it, so we redraw after each frame)
+  if (showing_result) {
+    unsigned long elapsed = now - (result_until - RESULT_DURATION_MS);
+    unsigned long remaining = (result_until > now) ? (result_until - now) : 0;
+    unsigned long total = RESULT_DURATION_MS;
+
+    tft.fillRect(0, 194, 320, 46, TFT_DARKGREY);
+    tft.fillRect(0, 197, 320, 40, TFT_BLUE);
+
+    tft.setTextColor(TFT_WHITE, TFT_BLUE);
+    const char *name = lookupPainting(last_qr_payload.c_str());
+    tft.drawString(name ? name : last_qr_payload.c_str(), 5, 200, 2);
+
+    tft.setTextColor(name ? TFT_GREEN : TFT_YELLOW, TFT_BLUE);
+    tft.drawString(name ? "Painting Identified" : "Unknown QR", 5, 218, 1);
+
+    uint16_t barW = map(remaining, 0, total, 0, 316);
+    tft.drawRect(2, 234, 316, 3, TFT_WHITE);
+    tft.fillRect(2, 234, barW, 3, TFT_GREEN);
+  }
+}
+
+// ============================================================
+// CORE 0: QR scanner — runs independently from camera loop
+// ============================================================
+void scannerTask(void *pvParameters) {
+  for (;;) {
+    if (frame_copy_ready) {
+      frame_copy_ready = false;
+
+      // Convert RGB565 → grayscale into grayscale_buf
+      uint8_t *src = pixel_buf;
+      for (int i = 0; i < 320 * 240; i++) {
+        uint16_t pixel = (src[i * 2] << 8) | src[i * 2 + 1];
+        uint8_t r5 = (pixel >> 11) & 0x1F;
+        uint8_t g6 = (pixel >> 5)  & 0x3F;
+        uint8_t b5 =  pixel        & 0x1F;
+        uint8_t r = (r5 << 3) | (r5 >> 2);
+        uint8_t g = (g6 << 2) | (g6 >> 4);
+        uint8_t b = (b5 << 3) | (b5 >> 2);
+        grayscale_buf[i] = (r * 77 + g * 150 + b * 29) >> 8;
+      }
+
+      // QR detection
+      int w = 0, h = 0;
+      uint8_t *qbuf = quirc_begin(qr, &w, &h);
+      memcpy(qbuf, grayscale_buf, w * h);
+      quirc_end(qr);
+
+      if (quirc_count(qr) > 0) {
+        struct quirc_code code;
+        struct quirc_data data;
+        quirc_extract(qr, 0, &code);
+        if (quirc_decode(&code, &data) == QUIRC_SUCCESS) {
+          int len = data.payload_len;
+          if (len > 63) len = 63;
+          char tmp[64];
+          memcpy(tmp, data.payload, len);
+          tmp[len] = '\0';
+          for (int i = 0; i < len; i++) {
+            if (tmp[i] < 32) { tmp[i] = '\0'; break; }
+          }
+          strncpy(qr_payload, tmp, 63);
+          qr_payload[63] = '\0';
+          qr_detected = true;
+          Serial.print("QR: ");
+          Serial.println(qr_payload);
+        }
+      }
+    } else {
+      vTaskDelay(5 / portTICK_PERIOD_MS); // yield while waiting
     }
   }
 }
