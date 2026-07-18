@@ -26,11 +26,18 @@ struct quirc *qr = nullptr;
 
 uint8_t *grayscale_buf = nullptr;
 
-// Shared result
-volatile bool qr_detected = false;
+// Core 0 → Core 1
+volatile bool qr_found = false;
 char qr_payload[64] = "";
 
+// Core 1 → Core 0
+volatile bool frame_ready_for_scan = false;
+volatile bool allow_scan = true; // set false during result display
+
 const unsigned long RESULT_DURATION_MS = 5000;
+
+const int FRAMES_BETWEEN_SCANS = 30;
+int frame_counter = 0;
 
 TaskHandle_t Task0;
 
@@ -123,22 +130,6 @@ void drawResultScreen(const char *painting_name, bool known) {
   tft.setTextDatum(TL_DATUM);
 }
 
-// Convert RGB565 camera frame to grayscale in grayscale_buf
-void convertToGrayscale(camera_fb_t *fb) {
-  uint8_t *src = fb->buf;
-  for (int i = 0; i < 320 * 240; i++) {
-    uint16_t pixel = (src[i*2] << 8) | src[i*2+1];
-    uint8_t r5 = (pixel >> 11) & 0x1F;
-    uint8_t g6 = (pixel >> 5)  & 0x3F;
-    uint8_t b5 =  pixel        & 0x1F;
-    uint8_t r = (r5 << 3) | (r5 >> 2);
-    uint8_t g = (g6 << 2) | (g6 >> 4);
-    uint8_t b = (b5 << 3) | (b5 >> 2);
-    grayscale_buf[i] = (r * 77 + g * 150 + b * 29) >> 8;
-  }
-}
-
-// Drain all pending camera frames to empty the buffer pool
 void drainCameraBuffers() {
   for (int i = 0; i < 3; i++) {
     camera_fb_t *fb = esp_camera_fb_get();
@@ -146,99 +137,115 @@ void drainCameraBuffers() {
   }
 }
 
-// ------------------- CORE 1: VIDEO & RESULT LOOP -------------------
+// ------------------- CORE 1: VIDEO LOOP -------------------
 void loop() {
   unsigned long now = millis();
 
-  // ---- QR RESULT STATE ----
-  // Step 4: black screen with QR text, wait for timeout
-  if (qr_detected) {
-    // Draw result screen once
+  // ---- RESULT STATE: ONLY entered when QR is detected ----
+  if (qr_found) {
+    // Step 1: Turn off screen
+    tft.fillScreen(TFT_BLACK);
+
+    // Step 2: Drain all camera buffers to free memory
+    drainCameraBuffers();
+
+    // Step 3: Clear the QR flag so loop can resume normally after
+    qr_found = false;
+
+    // Step 4: Display the result text on black screen
     const char *name = lookupPainting(qr_payload);
     drawResultScreen(name ? name : qr_payload, name != nullptr);
 
-    unsigned long result_until = now + RESULT_DURATION_MS;
+    // Wait for the display duration
+    delay(RESULT_DURATION_MS);
 
-    // Wait out the timeout — camera is already stopped from step 2
-    while (millis() < result_until) {
-      // Keep draining any stray camera frames that may come in
-      camera_fb_t *fb = esp_camera_fb_get();
-      if (fb) esp_camera_fb_return(fb);
-      delay(10);
-    }
-
-    // Step 5: Done — empty everything
-    qr_detected = false;
+    // Step 5: Empty everything and start from zero
     memset(qr_payload, 0, 64);
+    allow_scan = true;
+    frame_counter = 0;
+    frame_ready_for_scan = false;
     tft.fillScreen(TFT_BLACK);
 
-    // Drain any buffered frames before resuming
+    // Drain any stray frames that came in during result display
     drainCameraBuffers();
 
-    // Start from zero — back to live video
     return;
   }
 
-  // ---- LIVE VIDEO CONTINUOUSLY ----
+  // ---- LIVE VIDEO: 30fps continuously ----
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
 
-  // Display the live frame
+  // Display frame immediately
   tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
 
-  // ---- QR DETECTION ON THIS FRAME ----
-  // Convert to grayscale
-  convertToGrayscale(fb);
+  // Feed grayscale to Core 0 every N frames
+  frame_counter++;
+  if (frame_counter >= FRAMES_BETWEEN_SCANS && !frame_ready_for_scan && allow_scan) {
+    frame_counter = 0;
 
-  // Return camera frame BEFORE stopping the camera
-  // (step 2: video has already been "paused" by the result state above)
-  esp_camera_fb_return(fb);
-
-  // Step 3: Scan this frame with quirc
-  // Core 0 does the heavy quirc decode while camera is free
-  // We signal Core 0 by filling grayscale_buf (it watches for new data)
-
-  // Actually, let's do the scan right here in Core 1 since Core 0 adds complexity
-  // and we want to guarantee the camera is fully stopped before scanning starts
-  // Run quirc decode in-place on grayscale_buf
-  int w = 0, h = 0;
-  uint8_t *qbuf = quirc_begin(qr, &w, &h);
-  if (qbuf) {
-    memcpy(qbuf, grayscale_buf, 320 * 240);
-  }
-  quirc_end(qr);
-
-  if (quirc_count(qr) > 0) {
-    struct quirc_code code;
-    struct quirc_data data;
-    quirc_extract(qr, 0, &code);
-    if (quirc_decode(&code, &data) == QUIRC_SUCCESS) {
-      int len = data.payload_len;
-      if (len > 63) len = 63;
-      char tmp[64];
-      memcpy(tmp, data.payload, len);
-      tmp[len] = '\0';
-      for (int i = 0; i < len; i++) {
-        if (tmp[i] < 32) { tmp[i] = '\0'; break; }
-      }
-
-      Serial.print("QR: ");
-      Serial.println(tmp);
-
-      strncpy(qr_payload, tmp, 63);
-      qr_payload[63] = '\0';
-      qr_detected = true;
+    uint8_t *src = fb->buf;
+    for (int i = 0; i < 320 * 240; i++) {
+      uint16_t pixel = (src[i*2] << 8) | src[i*2+1];
+      uint8_t r5 = (pixel >> 11) & 0x1F;
+      uint8_t g6 = (pixel >> 5)  & 0x3F;
+      uint8_t b5 =  pixel        & 0x1F;
+      uint8_t r = (r5 << 3) | (r5 >> 2);
+      uint8_t g = (g6 << 2) | (g6 >> 4);
+      uint8_t b = (b5 << 3) | (b5 >> 2);
+      grayscale_buf[i] = (r * 77 + g * 150 + b * 29) >> 8;
     }
+    frame_ready_for_scan = true;
   }
 
-  // Continue live video on next loop iteration (unless QR was found → result state takes over)
+  esp_camera_fb_return(fb);
 }
 
-// ------------------- CORE 0: QR SCANNER (unused in this version) -------------------
+// ------------------- CORE 0: QR SCANNER -------------------
 void scannerTask(void *pvParameters) {
-  // This task is not used in this version — scanning happens in Core 1 loop
-  // after the camera frame is returned, to guarantee camera is stopped first.
   for (;;) {
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    // Block until Core 1 gives us a frame
+    if (!frame_ready_for_scan) {
+      vTaskDelay(5 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    // Skip scanning if we're in result display mode
+    if (!allow_scan) {
+      frame_ready_for_scan = false;
+      vTaskDelay(5 / portTICK_PERIOD_MS);
+      continue;
+    }
+
+    frame_ready_for_scan = false;
+
+    int w = 0, h = 0;
+    uint8_t *qbuf = quirc_begin(qr, &w, &h);
+    if (qbuf) {
+      memcpy(qbuf, grayscale_buf, 320 * 240);
+    }
+    quirc_end(qr);
+
+    if (quirc_count(qr) > 0) {
+      struct quirc_code code;
+      struct quirc_data data;
+      quirc_extract(qr, 0, &code);
+      if (quirc_decode(&code, &data) == QUIRC_SUCCESS) {
+        int len = data.payload_len;
+        if (len > 63) len = 63;
+        char tmp[64];
+        memcpy(tmp, data.payload, len);
+        tmp[len] = '\0';
+        for (int i = 0; i < len; i++) {
+          if (tmp[i] < 32) { tmp[i] = '\0'; break; }
+        }
+        strncpy(qr_payload, tmp, 63);
+        qr_payload[63] = '\0';
+        qr_found = true;
+        allow_scan = false; // stop scanning during result display
+        Serial.print("QR: ");
+        Serial.println(qr_payload);
+      }
+    }
   }
 }
