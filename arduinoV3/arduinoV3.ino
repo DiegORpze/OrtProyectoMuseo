@@ -39,8 +39,6 @@ int frame_counter = 0;
 
 TaskHandle_t Task0;
 
-void setupCamera();
-
 void setup() {
   Serial.begin(230400);
   delay(1000);
@@ -73,13 +71,6 @@ void setup() {
     quirc_resize(qr, 320, 240);
   }
 
-  setupCamera();
-
-  xTaskCreatePinnedToCore(scannerTask, "Scanner", 10000, NULL, 1, &Task0, 0);
-  Serial.println("Ready");
-}
-
-void setupCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -111,7 +102,11 @@ void setupCamera() {
     tft.fillScreen(TFT_RED);
     tft.drawString("Cam Error", 10, 10, 2);
     Serial.printf("Error: 0x%x\n", err);
+    return;
   }
+
+  xTaskCreatePinnedToCore(scannerTask, "Scanner", 10000, NULL, 1, &Task0, 0);
+  Serial.println("Ready");
 }
 
 const char *getPaintingPrompt(const char *payload) {
@@ -142,16 +137,14 @@ void loop() {
   if (qr_found) {
     qr_found = false;
 
-    // 1. Screen off
+    // 1. Wake up display and clear any pending SPI operations
+    tft.writecommand(TFT_DISPLAYON);
     tft.fillScreen(TFT_BLACK);
 
-    // 2. Brief drain to clear current buffers
+    // 2. Drain camera to get a clean state
     drainCameraBuffers();
 
-    // 3. Deinit camera — completely resets DMA and buffer pool
-    esp_camera_deinit();
-
-    // 4. Draw result on clean screen
+    // 3. Show result
     const char *prompt = getPaintingPrompt(qr_payload);
     if (prompt) {
       showResult(prompt);
@@ -159,14 +152,21 @@ void loop() {
       showResult(qr_payload);
     }
 
-    // 5. Wait for result duration
+    // 4. Wait for result duration
     delay(RESULT_DURATION_MS);
 
-    // 6. Screen off before resuming
+    // 5. Turn display OFF before returning to video
+    tft.writecommand(TFT_DISPLAYOFF);
     tft.fillScreen(TFT_BLACK);
 
-    // 7. Reinit camera — fresh DMA state, empty buffer pool
-    setupCamera();
+    // 6. Drain accumulated camera frames
+    drainCameraBuffers();
+    drainCameraBuffers();
+    delay(100);
+    drainCameraBuffers();
+
+    // 7. Wake display back up
+    tft.writecommand(TFT_DISPLAYON);
 
     // 8. Reset state
     memset(qr_payload, 0, 64);
