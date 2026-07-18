@@ -89,7 +89,7 @@ void setup() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_RGB565;
   config.frame_size = FRAMESIZE_QVGA;
-  config.fb_count = 1;                  // SINGLE buffer — no tearing possible
+  config.fb_count = 1;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
   Serial.println("Initializing camera...");
@@ -111,17 +111,6 @@ void setup() {
   Serial.println("Ready");
 }
 
-// ================================================================
-// SINGLE-CORE COOPERATIVE MULTITASKING
-//
-// Phase cycles each loop() call:
-//   CAPTURE  -> pushImage -> CONVERT (if due) -> SCAN (if due) -> IDLE
-//
-// Camera fb is returned BEFORE any scan work starts. The display
-// uses its own internal line buffer, so display and camera are
-// fully decoupled. No task switching, no volatile flags, no races.
-// ================================================================
-
 enum Phase { CAPTURE, DISPLAY, CONVERT, SCAN_DECODE, RESULT };
 Phase phase = CAPTURE;
 
@@ -135,8 +124,6 @@ const unsigned long QR_COOLDOWN_MS = 3000;
 const unsigned long RESULT_DURATION_MS = 4000;
 unsigned long result_until = 0;
 
-// Convert the current frame to grayscale in scan_buf.
-// Returns immediately if already converted this frame.
 void convertFrame() {
   if (frame_converted || !fb) return;
   uint8_t *src = fb->buf;
@@ -153,37 +140,29 @@ void convertFrame() {
   frame_converted = true;
 }
 
-// Run one increment of QR detection.
-// quirc processes scan_buf row-by-row; we do one chunk per call
-// and store the row cursor in a static var so it resumes next call.
 bool runQuircIncrement() {
-  static int quirc_phase = 0;
-  static int row_start = 0;
+  static int quirc_step = 0;
 
   if (!qr) return false;
 
-  if (quirc_phase == 0) {
-    // Begin: feed grayscale to quirc
+  if (quirc_step == 0) {
     int w = 0, h = 0;
     uint8_t *qbuf = quirc_begin(qr, &w, &h);
     if (qbuf && frame_converted) {
       memcpy(qbuf, scan_buf, 320 * 240);
     }
     quirc_end(qr);
-    row_start = 0;
-    quirc_phase = 1;
+    quirc_step = 1;
     return false;
   }
 
-  if (quirc_phase == 1) {
-    // Check how many QR codes found
+  if (quirc_step == 1) {
     int count = quirc_count(qr);
-    quirc_phase = (count > 0) ? 2 : 0;
+    quirc_step = (count > 0) ? 2 : 0;
     return false;
   }
 
-  if (quirc_phase == 2) {
-    // Extract and decode
+  if (quirc_step == 2) {
     struct quirc_code code;
     struct quirc_data data;
     quirc_extract(qr, 0, &code);
@@ -200,7 +179,7 @@ bool runQuircIncrement() {
       qr_payload[63] = '\0';
       qr_found = true;
     }
-    quirc_phase = 0;
+    quirc_step = 0;
     return true;
   }
 
@@ -210,26 +189,16 @@ bool runQuircIncrement() {
 void loop() {
   unsigned long now = millis();
 
-restart:
   switch (phase) {
 
-    // -----------------------------------------------------------
-    // CAPTURE: get one frame from camera, return it immediately
-    // -----------------------------------------------------------
     case CAPTURE: {
       fb = esp_camera_fb_get();
-      if (!fb) {
-        phase = CAPTURE;
-        break;
-      }
+      if (!fb) break;
       frame_converted = false;
       phase = DISPLAY;
       break;
     }
 
-    // -----------------------------------------------------------
-    // DISPLAY: push frame to screen, then hand buffer back to camera
-    // -----------------------------------------------------------
     case DISPLAY: {
       if (fb) {
         tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
@@ -240,26 +209,15 @@ restart:
       break;
     }
 
-    // -----------------------------------------------------------
-    // CONVERT: RGB565 -> grayscale (done in one go, fast)
-    // -----------------------------------------------------------
     case CONVERT: {
       convertFrame();
       phase = SCAN_DECODE;
       break;
     }
 
-    // -----------------------------------------------------------
-    // SCAN_DECODE: run quirc one increment at a time
-    // -----------------------------------------------------------
     case SCAN_DECODE: {
       bool done = runQuircIncrement();
-      if (!done) {
-        // Yield this call — quirc needs more calls to finish
-        // Next loop() call continues here
-        break;
-      }
-      // Quirc finished: check result
+      if (!done) break;
       if (qr_found) {
         qr_found = false;
         unsigned long elapsed = now - last_qr_time;
@@ -280,9 +238,6 @@ restart:
       break;
     }
 
-    // -----------------------------------------------------------
-    // RESULT: show QR text for fixed duration, then resume video
-    // -----------------------------------------------------------
     case RESULT: {
       if (now >= result_until) {
         tft.fillScreen(TFT_BLACK);
