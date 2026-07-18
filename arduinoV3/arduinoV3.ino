@@ -22,9 +22,17 @@
 
 TFT_eSPI tft = TFT_eSPI();
 
-static uint8_t scan_buf[320 * 240];
+// Two buffers so camera and scan never fight
+static uint8_t *cam_buf[2] = { nullptr, nullptr };
+static uint8_t *scan_buf = nullptr;
+static int cam_write_idx = 0;
+static int cam_read_idx = 0;
 
 struct quirc *qr = nullptr;
+
+bool showing_result = false;
+unsigned long result_until = 0;
+const unsigned long RESULT_DURATION_MS = 4000;
 
 const char *lookupPainting(const char *payload) {
   if (strcmp(payload, "MonaLisa") == 0)    return "Mona Lisa";
@@ -56,9 +64,14 @@ void setup() {
   delay(150);
 
   tft.init();
-  tft.setRotation(2);
+  tft.setRotation(0);
   tft.fillScreen(TFT_BLACK);
   tft.setSwapBytes(false);
+
+  scan_buf = (uint8_t *)ps_malloc(320 * 240);
+  if (!scan_buf) {
+    Serial.println("Failed to allocate scan buffer!");
+  }
 
   qr = quirc_new();
   if (!qr) {
@@ -89,7 +102,7 @@ void setup() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_RGB565;
   config.frame_size = FRAMESIZE_QVGA;
-  config.fb_count = 1;
+  config.fb_count = 2;
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
   Serial.println("Initializing camera...");
@@ -111,21 +124,33 @@ void setup() {
   Serial.println("Ready");
 }
 
-enum Phase { CAPTURE, DISPLAY, CONVERT, SCAN_DECODE, RESULT };
-Phase phase = CAPTURE;
+void loop() {
+  unsigned long now = millis();
 
-camera_fb_t *fb = nullptr;
-bool frame_converted = false;
-bool qr_found = false;
-char qr_payload[64] = "";
-String last_qr_payload = "";
-unsigned long last_qr_time = 0;
-const unsigned long QR_COOLDOWN_MS = 3000;
-const unsigned long RESULT_DURATION_MS = 4000;
-unsigned long result_until = 0;
+  // ---- RESULT STATE: just wait, drain camera frames to keep buffer healthy ----
+  if (showing_result) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb) esp_camera_fb_return(fb);
 
-void convertFrame() {
-  if (frame_converted || !fb) return;
+    if (now >= result_until) {
+      showing_result = false;
+      tft.fillScreen(TFT_BLACK);
+    }
+    return;
+  }
+
+  // ---- LIVE VIDEO + QR SCAN ----
+
+  // Get a camera frame
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) return;
+
+  // Display it immediately
+  tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
+
+  // Convert the frame to grayscale for QR scanning
+  // This is done in-place using the camera frame buffer BEFORE returning it,
+  // so we don't need extra RAM. quirc will get its own copy after.
   uint8_t *src = fb->buf;
   for (int i = 0; i < 320 * 240; i++) {
     uint16_t pixel = (src[i * 2] << 8) | src[i * 2 + 1];
@@ -137,32 +162,20 @@ void convertFrame() {
     uint8_t b = (b5 << 3) | (b5 >> 2);
     scan_buf[i] = (r * 77 + g * 150 + b * 29) >> 8;
   }
-  frame_converted = true;
-}
 
-bool runQuircIncrement() {
-  static int quirc_step = 0;
+  // Return the camera frame immediately after conversion is done
+  // The display DMA was already scheduled by pushImage above
+  esp_camera_fb_return(fb);
 
-  if (!qr) return false;
-
-  if (quirc_step == 0) {
-    int w = 0, h = 0;
-    uint8_t *qbuf = quirc_begin(qr, &w, &h);
-    if (qbuf && frame_converted) {
-      memcpy(qbuf, scan_buf, 320 * 240);
-    }
-    quirc_end(qr);
-    quirc_step = 1;
-    return false;
+  // Now run QR detection on the grayscale data (camera is free to grab next frame)
+  int w = 0, h = 0;
+  uint8_t *qbuf = quirc_begin(qr, &w, &h);
+  if (qbuf) {
+    memcpy(qbuf, scan_buf, 320 * 240);
   }
+  quirc_end(qr);
 
-  if (quirc_step == 1) {
-    int count = quirc_count(qr);
-    quirc_step = (count > 0) ? 2 : 0;
-    return false;
-  }
-
-  if (quirc_step == 2) {
+  if (quirc_count(qr) > 0) {
     struct quirc_code code;
     struct quirc_data data;
     quirc_extract(qr, 0, &code);
@@ -175,75 +188,14 @@ bool runQuircIncrement() {
       for (int i = 0; i < len; i++) {
         if (tmp[i] < 32) { tmp[i] = '\0'; break; }
       }
-      strncpy(qr_payload, tmp, 63);
-      qr_payload[63] = '\0';
-      qr_found = true;
-    }
-    quirc_step = 0;
-    return true;
-  }
 
-  return false;
-}
+      Serial.print("QR: ");
+      Serial.println(tmp);
 
-void loop() {
-  unsigned long now = millis();
-
-  switch (phase) {
-
-    case CAPTURE: {
-      fb = esp_camera_fb_get();
-      if (!fb) break;
-      frame_converted = false;
-      phase = DISPLAY;
-      break;
-    }
-
-    case DISPLAY: {
-      if (fb) {
-        tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
-        esp_camera_fb_return(fb);
-        fb = nullptr;
-      }
-      phase = CONVERT;
-      break;
-    }
-
-    case CONVERT: {
-      convertFrame();
-      phase = SCAN_DECODE;
-      break;
-    }
-
-    case SCAN_DECODE: {
-      bool done = runQuircIncrement();
-      if (!done) break;
-      if (qr_found) {
-        qr_found = false;
-        unsigned long elapsed = now - last_qr_time;
-        if (strcmp(qr_payload, last_qr_payload.c_str()) != 0 ||
-            elapsed >= QR_COOLDOWN_MS) {
-          last_qr_payload = String(qr_payload);
-          last_qr_time = now;
-          Serial.print("QR: ");
-          Serial.println(qr_payload);
-          const char *name = lookupPainting(qr_payload);
-          drawResultScreen(name ? name : qr_payload, name != nullptr);
-          result_until = now + RESULT_DURATION_MS;
-          phase = RESULT;
-          break;
-        }
-      }
-      phase = CAPTURE;
-      break;
-    }
-
-    case RESULT: {
-      if (now >= result_until) {
-        tft.fillScreen(TFT_BLACK);
-        phase = CAPTURE;
-      }
-      break;
+      const char *name = lookupPainting(tmp);
+      drawResultScreen(name ? name : tmp, name != nullptr);
+      showing_result = true;
+      result_until = now + RESULT_DURATION_MS;
     }
   }
 }
