@@ -26,11 +26,9 @@ struct quirc *qr = nullptr;
 
 uint8_t *grayscale_buf = nullptr;
 
-// Core 0 → Core 1
 volatile bool qr_found = false;
 char qr_payload[64] = "";
 
-// Core 1 → Core 0
 volatile bool frame_ready_for_scan = false;
 volatile bool allow_scan = true;
 
@@ -111,24 +109,21 @@ void setup() {
   Serial.println("Ready");
 }
 
-// Museum logic: map QR payload to painting name
-const char *lookupPainting(const char *payload) {
-  if (strcmp(payload, "MonaLisa") == 0)    return "Mona Lisa";
-  if (strcmp(payload, "StarryNight") == 0)  return "Starry Night";
-  if (strcmp(payload, "TheScream") == 0)    return "The Scream";
-  return nullptr; // unknown QR
+// Museum logic: each painting gets its own custom display
+const char *getPaintingPrompt(const char *payload) {
+  if (strcmp(payload, "MonaLisa") == 0)
+    return "Mona Lisa - Da Vinci";
+  if (strcmp(payload, "StarryNight") == 0)
+    return "Starry Night - Van Gogh";
+  if (strcmp(payload, "TheScream") == 0)
+    return "The Scream - Munch";
+  return nullptr; // unknown
 }
 
-void drawResultScreen(const char *painting_name, bool known) {
+void showResult(const char *prompt) {
   tft.fillScreen(TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString(painting_name, 160, 90, 4);
-  tft.setTextColor(known ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
-  tft.drawString(known ? "Painting Identified" : "Unknown QR Code", 160, 140, 2);
-  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.drawString("Returning to live video...", 160, 200, 2);
-  tft.setTextDatum(TL_DATUM);
+  tft.drawString(prompt, 160, 110, 4);
 }
 
 void drainCameraBuffers() {
@@ -142,55 +137,45 @@ void drainCameraBuffers() {
 void loop() {
   unsigned long now = millis();
 
-  // ---- RESULT STATE: entered only when QR is detected ----
   if (qr_found) {
-    // 1. Turn screen off
+    // Turn screen off
     tft.fillScreen(TFT_BLACK);
 
-    // 2. Drain camera buffers multiple times to fully empty the DMA pipeline
+    // Drain camera to free memory
     drainCameraBuffers();
     drainCameraBuffers();
-
-    // 3. Small pause to let camera hardware fully settle after draining
     delay(100);
-
-    // 4. Drain again — just to be sure
     drainCameraBuffers();
 
-    // 5. Clear QR flag so this block doesn't re-enter
     qr_found = false;
 
-    // 6. Draw the painting name from museum logic
-    const char *name = lookupPainting(qr_payload);
-    if (name) {
-      drawResultScreen(name, true);
+    // Museum logic: display painting-specific prompt
+    const char *prompt = getPaintingPrompt(qr_payload);
+    if (prompt) {
+      showResult(prompt);
     } else {
-      drawResultScreen(qr_payload, false);
+      showResult(qr_payload);
     }
 
-    // 7. Wait for result display duration
     delay(RESULT_DURATION_MS);
 
-    // 8. Empty everything and return to live video
+    // Empty everything
     memset(qr_payload, 0, 64);
     allow_scan = true;
     frame_counter = 0;
     frame_ready_for_scan = false;
     tft.fillScreen(TFT_BLACK);
 
-    // Drain any frames that arrived during result display
     drainCameraBuffers();
-
     return;
   }
 
-  // ---- LIVE VIDEO: 30fps continuously ----
+  // ---- LIVE VIDEO ----
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
 
   tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
 
-  // Feed grayscale to Core 0 every N frames
   frame_counter++;
   if (frame_counter >= FRAMES_BETWEEN_SCANS && !frame_ready_for_scan && allow_scan) {
     frame_counter = 0;
