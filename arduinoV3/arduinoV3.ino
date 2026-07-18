@@ -53,10 +53,9 @@ void setup() {
   delay(150);
 
   tft.init();
-  tft.setRotation(2);
+  tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
   tft.setSwapBytes(false);
-  tft.setSPISpeed(20000000); // 20MHz instead of default ~40MHz
 
   qr = quirc_new();
   if (!qr) {
