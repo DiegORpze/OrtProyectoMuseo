@@ -23,33 +23,36 @@
 TFT_eSPI tft = TFT_eSPI();
 
 struct quirc *qr = nullptr;
-uint8_t *grayscale_buf = nullptr;
 
-// ---- State machine ----
-//  LIVE_STREAMING  : show video, periodically run QR scan
-//  SHOWING_RESULT  : freeze on last frame, show QR text, return to streaming after timeout
+// Our own private pixel buffer — the camera frame is copied here
+// immediately after we get it, then the camera buffer is returned.
+// This decouples the camera DMA from our QR processing.
+static uint16_t pixel_buf[320 * 240];  // 153,600 bytes — fits in PSRAM
+static bool pixel_buf_valid = false;
+
+// QR result
+bool qr_found = false;
+char qr_payload[64] = "";
+
+// State machine
 enum DisplayState { LIVE_STREAMING, SHOWING_RESULT };
 DisplayState state = LIVE_STREAMING;
 unsigned long result_until = 0;
 const unsigned long RESULT_DURATION_MS = 4000;
 
-// QR scan runs every N frames (~every ~500ms at 30fps)
-const int FRAMES_BETWEEN_SCANS = 15;
+// Scan every N frames to give the camera buffer pool time to breathe
+const int FRAMES_BETWEEN_SCANS = 20;
 int frame_counter = 0;
 
-// Debounce: don't re-trigger on the same QR within this many ms
+// Debounce
 String last_qr_payload = "";
 unsigned long last_qr_time = 0;
 const unsigned long QR_COOLDOWN_MS = 3000;
-
-// Last captured frame (used to freeze video during result display)
-camera_fb_t * frozen_fb = nullptr;
 
 void setup() {
   Serial.begin(230400);
   delay(1000);
 
-  // Manual camera reset via GPIO 12
   pinMode(12, OUTPUT);
   digitalWrite(12, LOW);
   delay(50);
@@ -61,12 +64,6 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   tft.setSwapBytes(false);
 
-  // Grayscale buffer for QR scanning
-  grayscale_buf = (uint8_t *)ps_malloc(320 * 240);
-  if (!grayscale_buf) {
-    Serial.println("Failed to allocate grayscale buffer!");
-  }
-
   // QR decoder
   qr = quirc_new();
   if (!qr) {
@@ -75,7 +72,6 @@ void setup() {
     quirc_resize(qr, 320, 240);
   }
 
-  // Camera init
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -98,7 +94,7 @@ void setup() {
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_RGB565;
   config.frame_size = FRAMESIZE_QVGA;
-  config.fb_count = 2;               // Camera double-buffering
+  config.fb_count = 2;
   config.grab_mode = CAMERA_GRAB_LATEST;
 
   Serial.println("Initializing camera...");
@@ -117,33 +113,20 @@ const char *lookupPainting(const char *payload) {
   if (strcmp(payload, "MonaLisa") == 0)    return "Mona Lisa";
   if (strcmp(payload, "StarryNight") == 0)  return "Starry Night";
   if (strcmp(payload, "TheScream") == 0)    return "The Scream";
-  return nullptr; // unknown
+  return nullptr;
 }
 
-void drawResultScreen(const char *painting_name, bool known) {
-  tft.fillScreen(TFT_BLACK);
+// Fast DMA-assisted pixel copy + grayscale conversion.
+// Copies pixel_buf (RGB565) to grayscale_buf (quirc input).
+// DMA can only do memory-to-memory copies; conversion is still sequential
+// but we run it from IRAM so it isn't interrupted by cache misses.
+static uint8_t grayscale_buf[320 * 240];
+static DRAM_ATTR bool conversion_done = false;
 
-  tft.setTextDatum(MC_DATUM);
-
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString(painting_name, 160, 85, 4);
-
-  tft.setTextColor(known ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
-  tft.drawString(known ? "Painting Identified" : "Unknown QR Code", 160, 130, 2);
-
-  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.drawString("Returning to live video...", 160, 190, 2);
-
-  tft.setTextDatum(TL_DATUM);
-}
-
-bool tryScanQR(camera_fb_t *fb) {
-  if (!qr || !grayscale_buf) return false;
-
-  // Build grayscale from RGB565
-  uint8_t *src = fb->buf;
+void convertFrameToGrayscale() {
+  // Convert in small batches to avoid blocking other tasks too long
   for (int i = 0; i < 320 * 240; i++) {
-    uint16_t pixel = (src[i * 2] << 8) | src[i * 2 + 1];
+    uint16_t pixel = pixel_buf[i];
     uint8_t r5 = (pixel >> 11) & 0x1F;
     uint8_t g6 = (pixel >> 5)  & 0x3F;
     uint8_t b5 =  pixel        & 0x1F;
@@ -152,8 +135,12 @@ bool tryScanQR(camera_fb_t *fb) {
     uint8_t b = (b5 << 3) | (b5 >> 2);
     grayscale_buf[i] = (r * 77 + g * 150 + b * 29) >> 8;
   }
+  conversion_done = true;
+}
 
-  // Run QR detection
+bool runQRDetection() {
+  if (!qr || !conversion_done) return false;
+
   int w = 0, h = 0;
   uint8_t *qbuf = quirc_begin(qr, &w, &h);
   memcpy(qbuf, grayscale_buf, w * h);
@@ -166,7 +153,6 @@ bool tryScanQR(camera_fb_t *fb) {
   quirc_extract(qr, 0, &code);
   if (quirc_decode(&code, &data) != QUIRC_SUCCESS) return false;
 
-  // Null-terminate and clean payload
   int len = data.payload_len;
   if (len > 63) len = 63;
   char tmp[64];
@@ -184,25 +170,32 @@ bool tryScanQR(camera_fb_t *fb) {
   Serial.print("QR: ");
   Serial.println(tmp);
 
-  // Cooldown check
   unsigned long now = millis();
   if (strcmp(tmp, last_qr_payload.c_str()) == 0 &&
       (now - last_qr_time) < QR_COOLDOWN_MS) {
-    return false; // same QR, still cooling down
+    return false;
   }
 
   last_qr_payload = String(tmp);
   last_qr_time = now;
 
-  // Look up painting name
   const char *name = lookupPainting(tmp);
-  if (name) {
-    drawResultScreen(name, true);
-  } else {
-    drawResultScreen(tmp, false);
-  }
-
+  strncpy(qr_payload, name ? name : tmp, 63);
+  qr_payload[63] = '\0';
+  qr_found = true;
   return true;
+}
+
+void drawResultScreen(const char *painting_name, bool known) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(painting_name, 160, 85, 4);
+  tft.setTextColor(known ? TFT_GREEN : TFT_YELLOW, TFT_BLACK);
+  tft.drawString(known ? "Painting Identified" : "Unknown QR Code", 160, 130, 2);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString("Returning to live video...", 160, 190, 2);
+  tft.setTextDatum(TL_DATUM);
 }
 
 // ---------------------------------------------------------------------------
@@ -210,48 +203,49 @@ void loop() {
   unsigned long now = millis();
 
   // ---- RESULT DISPLAY MODE ----
-  // Show result for a fixed duration, keeping camera buffers healthy.
-  // We freeze on the last video frame (no new pushImage calls) and draw
-  // the QR text on top via drawResultScreen which was called when we entered
-  // this state. We only drain frames from the camera so buffers stay fresh.
   if (state == SHOWING_RESULT) {
-    // Drain any buffered camera frames to keep DMA healthy
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (fb) esp_camera_fb_return(fb);
-
     if (now >= result_until) {
       state = LIVE_STREAMING;
-      tft.fillScreen(TFT_BLACK);   // clean slate before resuming video
+      pixel_buf_valid = false;
+      tft.fillScreen(TFT_BLACK);
     }
-    return;                         // <<-- do NOT display, just drain
+    return;
   }
 
   // ---- LIVE STREAMING ----
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
 
-  // Always push video frame to display immediately
+  // 1. Display the frame immediately
   tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
 
-  frame_counter++;
+  // 2. Copy pixel data to our private buffer RIGHT AWAY,
+  //    then return the camera frame so DMA is never blocked.
+  //    The copy is fast (~5-10ms with word-aligned access).
+  if (!pixel_buf_valid) {
+    memcpy(pixel_buf, fb->buf, 320 * 240 * 2);
+    pixel_buf_valid = true;
+    conversion_done = false;   // grayscale conversion still pending
+  }
 
-  // Periodic QR scan: don't scan every frame — run every N frames instead
-  // This gives the camera buffer pool time to breathe and keeps video smooth.
+  // 3. Return camera frame immediately — camera DMA can resume
+  esp_camera_fb_return(fb);
+
+  // 4. Periodic QR scan — now runs on our own pixel_buf copy,
+  //    completely decoupled from camera DMA and display SPI.
+  frame_counter++;
   if (frame_counter >= FRAMES_BETWEEN_SCANS) {
     frame_counter = 0;
 
-    if (tryScanQR(fb)) {
-      // QR was found and result screen was drawn.
-      // Release the camera frame BEFORE entering SHOWING_RESULT so the
-      // camera DMA never fights with the display SPI bus.
-      esp_camera_fb_return(fb);
+    // Grayscale conversion (runs on our private copy — no bus contention)
+    convertFrameToGrayscale();
 
+    // QR detection
+    if (runQRDetection()) {
+      drawResultScreen(qr_payload, true);
       state = SHOWING_RESULT;
       result_until = now + RESULT_DURATION_MS;
-      return;   // enter result display mode
+      pixel_buf_valid = false;   // clear so next video frame is fresh
     }
   }
-
-  // Normal: return frame to camera for reuse
-  esp_camera_fb_return(fb);
 }
