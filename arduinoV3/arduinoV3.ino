@@ -109,7 +109,6 @@ void setup() {
   Serial.println("Ready");
 }
 
-// Museum logic: each painting gets its own custom display
 const char *getPaintingPrompt(const char *payload) {
   if (strcmp(payload, "MonaLisa") == 0)
     return "Mona Lisa - Da Vinci";
@@ -117,7 +116,7 @@ const char *getPaintingPrompt(const char *payload) {
     return "Starry Night - Van Gogh";
   if (strcmp(payload, "TheScream") == 0)
     return "The Scream - Munch";
-  return nullptr; // unknown
+  return nullptr;
 }
 
 void showResult(const char *prompt) {
@@ -127,7 +126,7 @@ void showResult(const char *prompt) {
 }
 
 void drainCameraBuffers() {
-  for (int i = 0; i < 5; i++) {
+  for (int i = 0; i < 8; i++) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb) esp_camera_fb_return(fb);
   }
@@ -135,21 +134,22 @@ void drainCameraBuffers() {
 
 // ------------------- CORE 1: VIDEO LOOP -------------------
 void loop() {
-  unsigned long now = millis();
-
   if (qr_found) {
-    // Turn screen off
+    // 1. Screen off
     tft.fillScreen(TFT_BLACK);
 
-    // Drain camera to free memory
-    drainCameraBuffers();
-    drainCameraBuffers();
-    delay(100);
+    // 2. Drain camera completely
     drainCameraBuffers();
 
+    // 3. Give camera hardware time to fully settle
+    delay(200);
+
+    // 4. Drain again after settling
+    drainCameraBuffers();
+
+    // 5. Clear QR flag and draw result
     qr_found = false;
 
-    // Museum logic: display painting-specific prompt
     const char *prompt = getPaintingPrompt(qr_payload);
     if (prompt) {
       showResult(prompt);
@@ -157,16 +157,28 @@ void loop() {
       showResult(qr_payload);
     }
 
+    // 6. Wait for result duration
     delay(RESULT_DURATION_MS);
 
-    // Empty everything
+    // 7. Screen off again before returning to video
+    tft.fillScreen(TFT_BLACK);
+
+    // 8. Aggressively drain all buffered frames
+    drainCameraBuffers();
+    drainCameraBuffers();
+    delay(300);   // let camera DMA fully flush
+    drainCameraBuffers();
+    drainCameraBuffers();
+
+    // 9. Reset everything
     memset(qr_payload, 0, 64);
     allow_scan = true;
     frame_counter = 0;
     frame_ready_for_scan = false;
-    tft.fillScreen(TFT_BLACK);
 
+    // 10. One more drain before resuming
     drainCameraBuffers();
+
     return;
   }
 
