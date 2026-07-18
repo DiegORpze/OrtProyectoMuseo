@@ -38,6 +38,13 @@ void showResult(const char *prompt) {
   tft.drawString(prompt, 160, 110, 4);
 }
 
+void drainCameraFrames() {
+  for (int i = 0; i < 5; i++) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb) esp_camera_fb_return(fb);
+  }
+}
+
 void setupCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -62,13 +69,37 @@ void setupCamera() {
   config.pixel_format = PIXFORMAT_RGB565;
   config.frame_size = FRAMESIZE_QVGA;
   config.fb_count = 2;
-  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     tft.fillScreen(TFT_RED);
     tft.drawString("Cam Error", 10, 10, 2);
   }
+}
+
+void setup() {
+  Serial.begin(230400);
+  delay(1000);
+
+  pinMode(12, OUTPUT);
+  digitalWrite(12, LOW);
+  delay(50);
+  digitalWrite(12, HIGH);
+  delay(150);
+
+  tft.init();
+  tft.setRotation(2);
+  tft.fillScreen(TFT_BLACK);
+  tft.setSwapBytes(false);
+
+  grayscale_buf = (uint8_t *)ps_malloc(320 * 240);
+
+  qr = quirc_new();
+  if (qr) quirc_resize(qr, 320, 240);
+
+  setupCamera();
+  Serial.println("Ready");
 }
 
 bool scanQR(camera_fb_t *fb) {
@@ -113,65 +144,56 @@ bool scanQR(camera_fb_t *fb) {
   return true;
 }
 
-void setup() {
-  Serial.begin(230400);
-  delay(1000);
-
-  pinMode(12, OUTPUT);
-  digitalWrite(12, LOW);
-  delay(50);
-  digitalWrite(12, HIGH);
-  delay(150);
-
-  tft.init();
-  tft.setRotation(2);
-  tft.fillScreen(TFT_BLACK);
-  tft.setSwapBytes(false);
-
-  grayscale_buf = (uint8_t *)ps_malloc(320 * 240);
-
-  qr = quirc_new();
-  if (qr) quirc_resize(qr, 320, 240);
-
-  setupCamera();
-  Serial.println("Ready");
-}
-
 void loop() {
   static int frame_counter = 0;
   static bool in_result = false;
-
-  // Scan every 150 frames ≈ every 5 seconds at 30fps
   static const int FRAMES_BETWEEN_SCANS = 150;
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
 
-  // Display frame every time
+  // Always display the current frame
   tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
 
   if (!in_result) {
     frame_counter++;
+
+    // Time to scan?
     if (frame_counter >= FRAMES_BETWEEN_SCANS) {
       frame_counter = 0;
 
-      // Release frame first, then stop camera completely before scanning
+      // Return frame and stop camera before scanning
       esp_camera_fb_return(fb);
       esp_camera_deinit();
 
-      // Camera is now off — scan with no DMA contention
       bool found = scanQR(fb);
 
       if (found) {
         in_result = true;
         delay(5000);
+
+        // Done showing result — clear screen
         tft.fillScreen(TFT_BLACK);
-        esp_camera_deinit();
+
+        // Reinit camera
+        esp_camera_deinit(); // no-op safety
         setupCamera();
+
+        // Drain any buffered frames from the fresh camera init
+        drainCameraFrames();
+
+        // Small settle time for camera DMA to stabilize
+        delay(100);
+
+        // Drain again after settle
+        drainCameraFrames();
+
         in_result = false;
       } else {
-        // No QR found, reinit camera and continue
+        // No QR found — reinit and continue
+        esp_camera_deinit();
         setupCamera();
+        drainCameraFrames();
       }
       return;
     }
