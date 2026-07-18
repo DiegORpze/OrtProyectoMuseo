@@ -125,8 +125,8 @@ void showResult(const char *prompt) {
   tft.drawString(prompt, 160, 110, 4);
 }
 
-void drainCameraBuffers() {
-  for (int i = 0; i < 5; i++) {
+void drainCameraBuffers(int count) {
+  for (int i = 0; i < count; i++) {
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb) esp_camera_fb_return(fb);
   }
@@ -137,14 +137,18 @@ void loop() {
   if (qr_found) {
     qr_found = false;
 
-    // 1. Wake up display and clear any pending SPI operations
-    tft.writecommand(TFT_DISPLAYON);
-    tft.fillScreen(TFT_BLACK);
+    // 1. Turn display OFF — eliminates ALL SPI bus activity
+    tft.writecommand(0x10); // SLEEP IN
+    tft.writecommand(0x28); // DISPLAY OFF
+    delay(50);
 
-    // 2. Drain camera to get a clean state
-    drainCameraBuffers();
+    // 2. Aggressively drain ALL camera buffers
+    drainCameraBuffers(10);
+    delay(100);
+    drainCameraBuffers(10);
+    delay(200);
 
-    // 3. Show result
+    // 3. Draw result
     const char *prompt = getPaintingPrompt(qr_payload);
     if (prompt) {
       showResult(prompt);
@@ -152,27 +156,30 @@ void loop() {
       showResult(qr_payload);
     }
 
-    // 4. Wait for result duration
+    // 4. Wake display back up
+    tft.writecommand(0x11); // SLEEP OUT
+    tft.writecommand(0x29); // DISPLAY ON
+    delay(120); // wait for display to wake up
+
+    // 5. Wait for result duration
     delay(RESULT_DURATION_MS);
 
-    // 5. Turn display OFF before returning to video
-    tft.writecommand(TFT_DISPLAYOFF);
-    tft.fillScreen(TFT_BLACK);
+    // 6. Turn display OFF again before resuming
+    tft.writecommand(0x10);
+    tft.writecommand(0x28);
+    delay(50);
 
-    // 6. Drain accumulated camera frames
-    drainCameraBuffers();
-    drainCameraBuffers();
-    delay(100);
-    drainCameraBuffers();
-
-    // 7. Wake display back up
-    tft.writecommand(TFT_DISPLAYON);
-
-    // 8. Reset state
+    // 7. Reset everything
     memset(qr_payload, 0, 64);
     allow_scan = true;
     frame_counter = 0;
     frame_ready_for_scan = false;
+    tft.fillScreen(TFT_BLACK);
+
+    // 8. Wake display back up for live video
+    tft.writecommand(0x11);
+    tft.writecommand(0x29);
+    delay(120);
 
     return;
   }
