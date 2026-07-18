@@ -22,55 +22,23 @@
 
 TFT_eSPI tft = TFT_eSPI();
 
+static uint8_t *grayscale_buf = nullptr;
 struct quirc *qr = nullptr;
 
-uint8_t *grayscale_buf = nullptr;
+const char *getPaintingPrompt(const char *payload) {
+  if (strcmp(payload, "MonaLisa") == 0)    return "Mona Lisa - Da Vinci";
+  if (strcmp(payload, "StarryNight") == 0)  return "Starry Night - Van Gogh";
+  if (strcmp(payload, "TheScream") == 0)    return "The Scream - Munch";
+  return nullptr;
+}
 
-volatile bool qr_found = false;
-char qr_payload[64] = "";
-
-volatile bool frame_ready_for_scan = false;
-volatile bool allow_scan = true;
-
-const unsigned long RESULT_DURATION_MS = 5000;
-
-const int FRAMES_BETWEEN_SCANS = 30;
-int frame_counter = 0;
-
-TaskHandle_t Task0;
-
-void setup() {
-  Serial.begin(230400);
-  delay(1000);
-
-  pinMode(12, OUTPUT);
-  digitalWrite(12, LOW);
-  delay(50);
-  digitalWrite(12, HIGH);
-  delay(150);
-
-  tft.init();
-  tft.setRotation(2);
+void showResult(const char *prompt) {
   tft.fillScreen(TFT_BLACK);
-  tft.setSwapBytes(false);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(prompt, 160, 110, 4);
+}
 
-  if (ESP.getPsramSize() > 0) {
-    grayscale_buf = (uint8_t *)ps_malloc(320 * 240);
-  } else {
-    grayscale_buf = (uint8_t *)malloc(320 * 240);
-  }
-
-  if (!grayscale_buf) {
-    Serial.println("Failed to allocate grayscale buffer!");
-  }
-
-  qr = quirc_new();
-  if (!qr) {
-    Serial.println("Failed to allocate quirc memory");
-  } else {
-    quirc_resize(qr, 320, 240);
-  }
-
+void setupCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
@@ -96,164 +64,118 @@ void setup() {
   config.fb_count = 2;
   config.grab_mode = CAMERA_GRAB_LATEST;
 
-  Serial.println("Initializing camera...");
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     tft.fillScreen(TFT_RED);
     tft.drawString("Cam Error", 10, 10, 2);
-    Serial.printf("Error: 0x%x\n", err);
-    return;
+  }
+}
+
+bool scanQR(camera_fb_t *fb) {
+  uint8_t *src = fb->buf;
+  for (int i = 0; i < 320 * 240; i++) {
+    uint16_t pixel = (src[i*2] << 8) | src[i*2+1];
+    uint8_t r5 = (pixel >> 11) & 0x1F;
+    uint8_t g6 = (pixel >> 5)  & 0x3F;
+    uint8_t b5 =  pixel        & 0x1F;
+    uint8_t r = (r5 << 3) | (r5 >> 2);
+    uint8_t g = (g6 << 2) | (g6 >> 4);
+    uint8_t b = (b5 << 3) | (b5 >> 2);
+    grayscale_buf[i] = (r * 77 + g * 150 + b * 29) >> 8;
   }
 
-  xTaskCreatePinnedToCore(scannerTask, "Scanner", 10000, NULL, 1, &Task0, 0);
+  int w = 0, h = 0;
+  uint8_t *qbuf = quirc_begin(qr, &w, &h);
+  if (qbuf) memcpy(qbuf, grayscale_buf, 320 * 240);
+  quirc_end(qr);
+
+  if (quirc_count(qr) == 0) return false;
+
+  struct quirc_code code;
+  struct quirc_data data;
+  quirc_extract(qr, 0, &code);
+  if (quirc_decode(&code, &data) != QUIRC_SUCCESS) return false;
+
+  int len = data.payload_len;
+  if (len > 63) len = 63;
+  char tmp[64];
+  memcpy(tmp, data.payload, len);
+  tmp[len] = '\0';
+  for (int i = 0; i < len; i++) {
+    if (tmp[i] < 32) { tmp[i] = '\0'; break; }
+  }
+
+  Serial.print("QR: ");
+  Serial.println(tmp);
+
+  const char *prompt = getPaintingPrompt(tmp);
+  showResult(prompt ? prompt : tmp);
+  return true;
+}
+
+void setup() {
+  Serial.begin(230400);
+  delay(1000);
+
+  pinMode(12, OUTPUT);
+  digitalWrite(12, LOW);
+  delay(50);
+  digitalWrite(12, HIGH);
+  delay(150);
+
+  tft.init();
+  tft.setRotation(2);
+  tft.fillScreen(TFT_BLACK);
+  tft.setSwapBytes(false);
+
+  grayscale_buf = (uint8_t *)ps_malloc(320 * 240);
+
+  qr = quirc_new();
+  if (qr) quirc_resize(qr, 320, 240);
+
+  setupCamera();
   Serial.println("Ready");
 }
 
-const char *getPaintingPrompt(const char *payload) {
-  if (strcmp(payload, "MonaLisa") == 0)
-    return "Mona Lisa - Da Vinci";
-  if (strcmp(payload, "StarryNight") == 0)
-    return "Starry Night - Van Gogh";
-  if (strcmp(payload, "TheScream") == 0)
-    return "The Scream - Munch";
-  return nullptr;
-}
-
-void showResult(const char *prompt) {
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString(prompt, 160, 110, 4);
-}
-
-void drainCameraBuffers(int count) {
-  for (int i = 0; i < count; i++) {
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (fb) esp_camera_fb_return(fb);
-  }
-}
-
-// ------------------- CORE 1: VIDEO LOOP -------------------
 void loop() {
-  if (qr_found) {
-    qr_found = false;
+  static int frame_counter = 0;
+  static bool in_result = false;
 
-    // 1. Turn display OFF — eliminates ALL SPI bus activity
-    tft.writecommand(0x10); // SLEEP IN
-    tft.writecommand(0x28); // DISPLAY OFF
-    delay(50);
+  // Scan every 150 frames ≈ every 5 seconds at 30fps
+  static const int FRAMES_BETWEEN_SCANS = 150;
 
-    // 2. Aggressively drain ALL camera buffers
-    drainCameraBuffers(10);
-    delay(100);
-    drainCameraBuffers(10);
-    delay(200);
-
-    // 3. Draw result
-    const char *prompt = getPaintingPrompt(qr_payload);
-    if (prompt) {
-      showResult(prompt);
-    } else {
-      showResult(qr_payload);
-    }
-
-    // 4. Wake display back up
-    tft.writecommand(0x11); // SLEEP OUT
-    tft.writecommand(0x29); // DISPLAY ON
-    delay(120); // wait for display to wake up
-
-    // 5. Wait for result duration
-    delay(RESULT_DURATION_MS);
-
-    // 6. Turn display OFF again before resuming
-    tft.writecommand(0x10);
-    tft.writecommand(0x28);
-    delay(50);
-
-    // 7. Reset everything
-    memset(qr_payload, 0, 64);
-    allow_scan = true;
-    frame_counter = 0;
-    frame_ready_for_scan = false;
-    tft.fillScreen(TFT_BLACK);
-
-    // 8. Wake display back up for live video
-    tft.writecommand(0x11);
-    tft.writecommand(0x29);
-    delay(120);
-
-    return;
-  }
-
-  // ---- LIVE VIDEO ----
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
 
+  // Display frame every time
   tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
 
-  frame_counter++;
-  if (frame_counter >= FRAMES_BETWEEN_SCANS && !frame_ready_for_scan && allow_scan) {
-    frame_counter = 0;
+  if (!in_result) {
+    frame_counter++;
+    if (frame_counter >= FRAMES_BETWEEN_SCANS) {
+      frame_counter = 0;
 
-    uint8_t *src = fb->buf;
-    for (int i = 0; i < 320 * 240; i++) {
-      uint16_t pixel = (src[i*2] << 8) | src[i*2+1];
-      uint8_t r5 = (pixel >> 11) & 0x1F;
-      uint8_t g6 = (pixel >> 5)  & 0x3F;
-      uint8_t b5 =  pixel        & 0x1F;
-      uint8_t r = (r5 << 3) | (r5 >> 2);
-      uint8_t g = (g6 << 2) | (g6 >> 4);
-      uint8_t b = (b5 << 3) | (b5 >> 2);
-      grayscale_buf[i] = (r * 77 + g * 150 + b * 29) >> 8;
+      // Release frame first, then stop camera completely before scanning
+      esp_camera_fb_return(fb);
+      esp_camera_deinit();
+
+      // Camera is now off — scan with no DMA contention
+      bool found = scanQR(fb);
+
+      if (found) {
+        in_result = true;
+        delay(5000);
+        tft.fillScreen(TFT_BLACK);
+        esp_camera_deinit();
+        setupCamera();
+        in_result = false;
+      } else {
+        // No QR found, reinit camera and continue
+        setupCamera();
+      }
+      return;
     }
-    frame_ready_for_scan = true;
   }
 
   esp_camera_fb_return(fb);
-}
-
-// ------------------- CORE 0: QR SCANNER -------------------
-void scannerTask(void *pvParameters) {
-  for (;;) {
-    if (!frame_ready_for_scan) {
-      vTaskDelay(5 / portTICK_PERIOD_MS);
-      continue;
-    }
-
-    if (!allow_scan) {
-      frame_ready_for_scan = false;
-      vTaskDelay(5 / portTICK_PERIOD_MS);
-      continue;
-    }
-
-    frame_ready_for_scan = false;
-
-    int w = 0, h = 0;
-    uint8_t *qbuf = quirc_begin(qr, &w, &h);
-    if (qbuf) {
-      memcpy(qbuf, grayscale_buf, 320 * 240);
-    }
-    quirc_end(qr);
-
-    if (quirc_count(qr) > 0) {
-      struct quirc_code code;
-      struct quirc_data data;
-      quirc_extract(qr, 0, &code);
-      if (quirc_decode(&code, &data) == QUIRC_SUCCESS) {
-        int len = data.payload_len;
-        if (len > 63) len = 63;
-        char tmp[64];
-        memcpy(tmp, data.payload, len);
-        tmp[len] = '\0';
-        for (int i = 0; i < len; i++) {
-          if (tmp[i] < 32) { tmp[i] = '\0'; break; }
-        }
-        strncpy(qr_payload, tmp, 63);
-        qr_payload[63] = '\0';
-        qr_found = true;
-        allow_scan = false;
-        Serial.print("QR: ");
-        Serial.println(qr_payload);
-      }
-    }
-  }
 }
