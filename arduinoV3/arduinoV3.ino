@@ -153,6 +153,11 @@ void loop() {
   if (update_ui) {
     update_ui = false; // Clear flag
     String payload = String(new_payload);
+
+    // DEBUG: This white box at the top will show you EXACTLY what the camera read!
+    tft.fillRect(0, 0, 240, 20, TFT_WHITE);
+    tft.setTextColor(TFT_BLACK, TFT_WHITE);
+    tft.drawString("Raw: " + payload, 2, 2, 2);
     
     // --- MUSEUM LOGIC HERE ---
     if (payload == "MonaLisa") {
@@ -201,7 +206,17 @@ void scannerTask(void *pvParameters) {
         quirc_extract(qr, 0, &code);
         
         if (quirc_decode(&code, &data) == QUIRC_SUCCESS) {
-          String payload = String((const char *)data.payload);
+          // FIX: quirc doesn't null-terminate the string! We must do it manually.
+          int len = data.payload_len;
+          if (len > 63) len = 63; // Prevent overflow
+          
+          char temp_buf[64];
+          memcpy(temp_buf, data.payload, len);
+          temp_buf[len] = '\0'; // Add the missing null terminator!
+          
+          // Convert to String and remove any accidental spaces/newlines
+          String payload = String(temp_buf);
+          payload.trim(); 
           
           // Only trigger a UI update if it's a different QR code than last time
           if (payload != last_painting_name) {
