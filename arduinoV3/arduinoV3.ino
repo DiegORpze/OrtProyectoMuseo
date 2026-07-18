@@ -24,21 +24,20 @@ TFT_eSPI tft = TFT_eSPI();
 
 struct quirc *qr = nullptr;
 
-// Shared variables between cores
+// Shared variables
 volatile bool frame_ready_for_scan = false;
 uint8_t *grayscale_buf = nullptr;
 
-// Variables for Core 0 to pass data back to Core 1 safely
+// QR result passed from Core 0 -> Core 1
 volatile bool new_qr_data = false;
 char new_payload[64] = "";
-String last_scanned_payload = "";     // Avoid re-processing the same QR
-unsigned long last_scan_time = 0;     // Timestamp of last successful scan
+String last_scanned_payload = "";
 
-// Painting display state on Core 1
-String current_painting_text = "";
-unsigned long painting_display_until = 0; // Timestamp when painting box should hide
-const unsigned long PAINTING_BOX_DURATION_MS = 5000; // Show for 5 seconds
-const unsigned long QR_SCAN_COOLDOWN_MS = 2000;      // Ignore same QR for 2 seconds
+// State machine
+enum DisplayState { LIVE_VIDEO, SHOWING_RESULT };
+volatile DisplayState state = LIVE_VIDEO;
+unsigned long result_display_until = 0;
+const unsigned long RESULT_DISPLAY_MS = 4000;
 
 // Task handle for Core 0
 TaskHandle_t Task0;
@@ -59,7 +58,7 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   tft.setSwapBytes(false);
 
-  // Allocate memory safely
+  // Allocate grayscale buffer for QR scanning
   if (ESP.getPsramSize() > 0) {
     grayscale_buf = (uint8_t *)ps_malloc(320 * 240);
   } else {
@@ -126,96 +125,107 @@ void setup() {
   );
 }
 
-// ------------------- CORE 1: VIDEO & UI LOOP -------------------
+// Map QR payload to painting display name
+String getPaintingName(const char *payload) {
+  if (strcmp(payload, "MonaLisa") == 0)    return "Mona Lisa";
+  if (strcmp(payload, "StarryNight") == 0)  return "Starry Night";
+  if (strcmp(payload, "TheScream") == 0)    return "The Scream";
+  return String(payload); // unknown — show raw text
+}
+
+// Draw the result overlay (always starts from a clean black screen)
+void drawResultScreen(const String &name, bool known) {
+  tft.fillScreen(TFT_BLACK);
+
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(name, 160, 90, 4);
+
+  if (known) {
+    tft.setTextColor(TFT_GREEN, TFT_BLACK);
+    tft.drawString("Painting Identified", 160, 135, 2);
+  } else {
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString("Unknown QR Code", 160, 135, 2);
+  }
+
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString("Returning to live video...", 160, 195, 2);
+
+  tft.setTextDatum(TL_DATUM); // reset
+}
+
+// ------------------- CORE 1: VIDEO & RESULT LOOP -------------------
 void loop() {
-  camera_fb_t * fb = esp_camera_fb_get();
-  if (!fb) return;
+  unsigned long now = millis();
 
-  // 1. Draw the live video to the screen
-  tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
+  switch (state) {
 
-  // 2. Give Core 0 a new frame to scan (only when it's idle)
-  if (!frame_ready_for_scan && grayscale_buf) {
-    uint8_t *src = fb->buf;
-    uint16_t *dst = (uint16_t *)fb->buf; // reuse buffer to avoid extra work in next step
+    // ---- LIVE VIDEO ----
+    case LIVE_VIDEO: {
+      camera_fb_t * fb = esp_camera_fb_get();
+      if (!fb) return;
 
-    for (int i = 0; i < 320 * 240; i++) {
-      uint16_t pixel = (src[i*2] << 8) | src[i*2+1];
+      // Draw video frame to screen
+      tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
 
-      // Extract R, G, B (RGB565)
-      uint8_t r5 = (pixel >> 11) & 0x1F;
-      uint8_t g6 = (pixel >> 5) & 0x3F;
-      uint8_t b5 = pixel & 0x1F;
+      // Feed grayscale to QR scanner when idle
+      if (!frame_ready_for_scan && grayscale_buf) {
+        uint8_t *src = fb->buf;
+        for (int i = 0; i < 320 * 240; i++) {
+          uint16_t pixel = (src[i*2] << 8) | src[i*2+1];
+          uint8_t r5 = (pixel >> 11) & 0x1F;
+          uint8_t g6 = (pixel >> 5)  & 0x3F;
+          uint8_t b5 = pixel & 0x1F;
+          uint8_t r = (r5 << 3) | (r5 >> 2);
+          uint8_t g = (g6 << 2) | (g6 >> 4);
+          uint8_t b = (b5 << 3) | (b5 >> 2);
+          grayscale_buf[i] = (r * 77 + g * 150 + b * 29) >> 8;
+        }
+        frame_ready_for_scan = true;
+      }
 
-      // Scale to 8-bit
-      uint8_t r = (r5 << 3) | (r5 >> 2);
-      uint8_t g = (g6 << 2) | (g6 >> 4);
-      uint8_t b = (b5 << 3) | (b5 >> 2);
+      // QR found — transition to result display
+      if (new_qr_data) {
+        new_qr_data = false;
 
-      // Luminance
-      grayscale_buf[i] = (r * 77 + g * 150 + b * 29) >> 8;
+        Serial.print("QR scanned: ");
+        Serial.println(new_payload);
+
+        String name = getPaintingName(new_payload);
+        bool known = (name != String(new_payload));
+
+        // CRITICAL: return the camera frame BEFORE touching the screen.
+        // This prevents camera DMA and display SPI from fighting.
+        esp_camera_fb_return(fb);
+
+        // Now switch state and draw — camera buffer is already returned
+        state = SHOWING_RESULT;
+        result_display_until = now + RESULT_DISPLAY_MS;
+
+        drawResultScreen(name, known);
+        break;
+      }
+
+      esp_camera_fb_return(fb);
+      break;
     }
-    frame_ready_for_scan = true;
-  }
 
-  // 3. If Core 0 found a NEW QR code, process it
-  if (new_qr_data) {
-    new_qr_data = false; // Clear atomically
+    // ---- SHOWING_RESULT ----
+    case SHOWING_RESULT: {
+      // Drain any frames the camera buffered while we were in LIVE_VIDEO.
+      // This keeps the camera's buffer pool healthy so the next frame
+      // we grab is guaranteed fresh, not a stale one from 4 seconds ago.
+      camera_fb_t * fb = esp_camera_fb_get();
+      if (fb) esp_camera_fb_return(fb);
 
-    // Apply cooldown to avoid repeated triggers of the same QR
-    unsigned long now = millis();
-    if (last_scanned_payload != String(new_payload) ||
-        (now - last_scan_time) > QR_SCAN_COOLDOWN_MS) {
-
-      last_scanned_payload = String(new_payload);
-      last_scan_time = now;
-
-      Serial.print("QR scanned: ");
-      Serial.println(new_payload);
-
-      // --- MUSEUM LOGIC ---
-      if (String(new_payload) == "MonaLisa") {
-        current_painting_text = "Painting: Mona Lisa";
+      if (now >= result_display_until) {
+        state = LIVE_VIDEO;
+        tft.fillScreen(TFT_BLACK); // clean slate before resuming video
       }
-      else if (String(new_payload) == "StarryNight") {
-        current_painting_text = "Painting: Starry Night";
-      }
-      else if (String(new_payload) == "TheScream") {
-        current_painting_text = "Painting: The Scream";
-      }
-      else {
-        current_painting_text = "Read: " + String(new_payload);
-      }
-
-      painting_display_until = now + PAINTING_BOX_DURATION_MS;
-
-      // Debug: flash a small indicator that QR was read
-      tft.fillRect(0, 0, 10, 10, TFT_GREEN);
+      break;
     }
   }
-
-  // 4. Draw the painting text box EVERY FRAME while active
-  //    It persists across frames because we draw it after every pushImage
-  if (current_painting_text != "" && millis() < painting_display_until) {
-    // Semi-transparent dark overlay behind the text box for readability
-    tft.fillRect(0, 200, 320, 26, TFT_DARKGREY);
-    tft.fillRect(0, 203, 320, 20, TFT_BLUE);
-
-    tft.setTextColor(TFT_WHITE, TFT_BLUE);
-    tft.drawString(current_painting_text, 5, 206, 2);
-
-    // Progress bar showing time remaining
-    unsigned long remaining = painting_display_until - millis();
-    uint16_t barWidth = map(remaining, 0, PAINTING_BOX_DURATION_MS, 0, 316);
-    tft.drawRect(2, 225, 316, 4, TFT_WHITE);
-    tft.fillRect(2, 225, barWidth, 4, TFT_GREEN);
-  } else if (current_painting_text != "" && millis() >= painting_display_until) {
-    // Auto-clear after timeout
-    current_painting_text = "";
-    last_scanned_payload = "";
-  }
-
-  esp_camera_fb_return(fb);
 }
 
 // ------------------- CORE 0: QR SCANNER LOOP -------------------
@@ -241,20 +251,19 @@ void scannerTask(void *pvParameters) {
           int len = data.payload_len;
           if (len > 63) len = 63;
 
-          // Build null-terminated string safely
           char temp_buf[64];
           memcpy(temp_buf, data.payload, len);
           temp_buf[len] = '\0';
 
-          // Remove whitespace
+          // Strip trailing whitespace
           for (int i = 0; i < len; i++) {
-            if (temp_buf[i] == ' ' || temp_buf[i] == '\n' || temp_buf[i] == '\r') {
+            if (temp_buf[i] == ' ' || temp_buf[i] == '\n' ||
+                temp_buf[i] == '\r' || temp_buf[i] == '\t') {
               temp_buf[i] = '\0';
               break;
             }
           }
 
-          // Signal Core 1 with the raw payload; Core 1 handles dedup/cooldown
           strncpy(new_payload, temp_buf, 63);
           new_payload[63] = '\0';
           new_qr_data = true;
