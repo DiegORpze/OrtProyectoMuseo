@@ -30,9 +30,6 @@
 
 struct quirc *qrScanner = nullptr;
 
-int quircWidth = 0;
-int quircHeight = 0;
-
 unsigned long lastStatusTime = 0;
 unsigned long frameCounter = 0;
 unsigned long qrCounter = 0;
@@ -97,17 +94,13 @@ bool setupCamera() {
 }
 
 // =====================================================
-// Ajustar quirc al tamaño real del frame
+// Inicializar quirc UNA SOLA VEZ al inicio
 // =====================================================
 
-bool prepareQuirc(int width, int height) {
+bool initQuirc(int width, int height) {
   if (qrScanner == nullptr) {
     Serial.println("ERROR: qrScanner es nullptr.");
     return false;
-  }
-
-  if (quircWidth == width && quircHeight == height) {
-    return true;
   }
 
   Serial.printf("Configurando quirc para %d x %d pixeles...\n", width, height);
@@ -120,9 +113,6 @@ bool prepareQuirc(int width, int height) {
     Serial.printf("PSRAM libre: %u bytes\n", ESP.getFreePsram());
     return false;
   }
-
-  quircWidth = width;
-  quircHeight = height;
 
   Serial.println("quirc configurado correctamente.");
   return true;
@@ -198,13 +188,10 @@ void scanFrame(camera_fb_t *frame) {
   int height = frame->height;
   size_t expectedBytes = width * height;
 
-  // DEBUG: mostrar info del frame
   Serial.printf("Frame: %dx%d, %u bytes\n", width, height, (unsigned int)frame->len);
 
   if (frame->len < expectedBytes) {
     Serial.println("ERROR: el framebuffer es mas pequeno de lo esperado.");
-    Serial.printf("Recibido: %u bytes\n", (unsigned int)frame->len);
-    Serial.printf("Esperado: %u bytes\n", (unsigned int)expectedBytes);
     return;
   }
 
@@ -213,29 +200,26 @@ void scanFrame(camera_fb_t *frame) {
     return;
   }
 
-  if (!prepareQuirc(width, height)) {
-    return;
-  }
-
-  int scannerWidth = 0;
-  int scannerHeight = 0;
-
-  uint8_t *quircBuffer = quirc_begin(qrScanner, &scannerWidth, &scannerHeight);
+  // quirc_begin devuelve un puntero al buffer interno
+  int quircW = 0, quircH = 0;
+  uint8_t *quircBuffer = quirc_begin(qrScanner, &quircW, &quircH);
 
   if (quircBuffer == nullptr) {
     Serial.println("ERROR: quirc_begin devolvio nullptr.");
     return;
   }
 
-  if (scannerWidth != width || scannerHeight != height) {
-    Serial.println("ERROR: las dimensiones de quirc no coinciden.");
-    Serial.printf("Frame: %d x %d | quirc: %d x %d\n", width, height, scannerWidth, scannerHeight);
+  if (quircW != width || quircH != height) {
+    Serial.printf("WARN: dimensiones no coinciden. Frame: %dx%d, quirc: %dx%d\n",
+      width, height, quircW, quircH);
     quirc_end(qrScanner);
     return;
   }
 
+  // Copiar el frame al buffer de quirc
   memcpy(quircBuffer, frame->buf, expectedBytes);
 
+  // Analizar y buscar QR
   quirc_end(qrScanner);
 
   int qrCount = quirc_count(qrScanner);
@@ -257,7 +241,8 @@ void scanFrame(camera_fb_t *frame) {
     if (decodeResult == QUIRC_SUCCESS) {
       printQRData(data, i);
     } else {
-      Serial.printf("QR #%d encontrado, pero no se pudo decodificar: %s\n", i, quirc_strerror(decodeResult));
+      Serial.printf("QR #%d encontrado, pero no se pudo decodificar: %s\n",
+        i, quirc_strerror(decodeResult));
     }
   }
 }
@@ -278,9 +263,9 @@ void setup() {
 
   Serial.printf("PSRAM detectada: %s\n", psramFound() ? "SI" : "NO");
   Serial.printf("Heap libre al iniciar: %u bytes\n", ESP.getFreeHeap());
-  Serial.printf("PSRAM total: %u bytes\n", ESP.getPsramSize());
   Serial.printf("PSRAM libre: %u bytes\n", ESP.getFreePsram());
 
+  // Crear quirc
   qrScanner = quirc_new();
 
   if (qrScanner == nullptr) {
@@ -290,22 +275,30 @@ void setup() {
 
   Serial.println("Objeto quirc creado correctamente.");
 
+  // Inicializar camara
   if (!setupCamera()) {
     Serial.println("No se puede continuar sin camara.");
     while (true) { delay(1000); }
   }
 
-  // Dejar que la camara se estabilice con 3 frames dummy
+  // Dejar que la camara se estabilice con frames dummy
   Serial.println("Esperando que la camara se estabilice...");
   for (int i = 0; i < 3; i++) {
     camera_fb_t *dummy = esp_camera_fb_get();
     if (dummy) {
-      Serial.printf("Frame dummy %d: %dx%d, %u bytes\n", i+1, dummy->width, dummy->height, (unsigned int)dummy->len);
+      Serial.printf("Frame dummy %d: %dx%d, %u bytes\n",
+        i+1, dummy->width, dummy->height, (unsigned int)dummy->len);
       esp_camera_fb_return(dummy);
     } else {
       Serial.printf("Frame dummy %d: NULL\n", i+1);
     }
     delay(100);
+  }
+
+  // Inicializar quirc UNA SOLA VEZ con las dimensiones de la camara
+  if (!initQuirc(320, 240)) {
+    Serial.println("ERROR: no se pudo inicializar quirc.");
+    while (true) { delay(1000); }
   }
 
   Serial.println();
