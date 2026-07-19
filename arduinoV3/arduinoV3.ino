@@ -32,6 +32,12 @@ const char *getPaintingPrompt(const char *payload) {
   return nullptr;
 }
 
+void showResult(const char *prompt) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(prompt, 160, 110, 4);
+}
+
 void setupCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -127,15 +133,13 @@ bool scanQR(camera_fb_t *fb) {
   Serial.println(tmp);
 
   const char *prompt = getPaintingPrompt(tmp);
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString(prompt ? prompt : tmp, 160, 110, 4);
-
+  showResult(prompt ? prompt : tmp);
   return true;
 }
 
 void loop() {
   static int frame_counter = 0;
+  static bool in_result = false;
   static const int FRAMES_BETWEEN_SCANS = 150;
 
   camera_fb_t *fb = esp_camera_fb_get();
@@ -143,18 +147,37 @@ void loop() {
 
   tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
 
-  frame_counter++;
-  if (frame_counter >= FRAMES_BETWEEN_SCANS) {
-    frame_counter = 0;
+  if (!in_result) {
+    frame_counter++;
 
-    esp_camera_fb_return(fb);
-    esp_camera_deinit();
+    if (frame_counter >= FRAMES_BETWEEN_SCANS) {
+      frame_counter = 0;
 
-    scanQR(fb);
+      esp_camera_fb_return(fb);
+      esp_camera_deinit();
 
-    esp_camera_deinit();
-    setupCamera();
-    return;
+      bool found = scanQR(fb);
+
+      if (found) {
+        // DEBUG: screen turns GREEN = QR was scanned successfully
+        tft.fillScreen(TFT_GREEN);
+        delay(5000);
+        tft.fillScreen(TFT_BLACK);
+
+        esp_camera_deinit();
+        setupCamera();
+        in_result = false;
+      } else {
+        // DEBUG: screen turns RED = scan done but no QR found
+        tft.fillScreen(TFT_RED);
+        delay(500);
+        tft.fillScreen(TFT_BLACK);
+
+        esp_camera_deinit();
+        setupCamera();
+      }
+      return;
+    }
   }
 
   esp_camera_fb_return(fb);
