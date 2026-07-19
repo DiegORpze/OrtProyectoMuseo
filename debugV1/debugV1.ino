@@ -126,16 +126,13 @@ void setup() {
   delay(2000);
   tft.fillScreen(TFT_BLACK);
 
-  // Show PSRAM status (bottom-left in rotation 3 = top-left visually flipped)
-  tft.setTextDatum(TL_DATUM);
-  tft.setCursor(10, 195);  // Flipped Y position
-  tft.println("PSRAM detectada.");
+  // Show PSRAM status - centered
+  tft.setTextDatum(TC_DATUM);
+  tft.drawString("PSRAM detectada.", 160, 210, 2);
   delay(500);
 
-  tft.setCursor(10, 175);  // Flipped Y position
-  tft.println("Camara inicializada");
-  tft.setCursor(10, 157);  // Flipped Y position
-  tft.println("correctamente.");
+  tft.drawString("Camara inicializada", 160, 185, 2);
+  tft.drawString("correctamente.", 160, 160, 2);
   delay(1000);
 
   // Final ready screen
@@ -154,15 +151,66 @@ void loop() {
   // Check for QR code with 100ms timeout
   if (lectorQR.receiveQrCode(&datosQR, 100)) {
     tft.fillScreen(TFT_BLACK);
+    tft.setFreeFont(&FreeMono9pt7b);
+    tft.setTextDatum(TL_DATUM);
+
+    // Draw a border
+    tft.drawRect(2, 2, 316, 236, TFT_WHITE);
+    tft.drawLine(10, 210, 310, 210, TFT_WHITE);
 
     if (datosQR.valid) {
-      // Display ONLY the payload - centered, large text
+      // QR Content header
+      tft.setTextColor(TFT_GREEN, TFT_BLACK);
+      tft.setTextDatum(TC_DATUM);
+      tft.drawString("QR DETECTADO", 160, 230, 2);
+
       tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.setFreeFont(&FreeMono9pt7b);
-      tft.setTextDatum(CC_DATUM);  // Center text
-      tft.drawString((char*)datosQR.payload, 160, 120, 2);
+      tft.setTextDatum(TL_DATUM);
+
+      // Show "CONTENIDO:"
+      tft.setCursor(15, 195);
+      tft.print("CONTENIDO: ");
+
+      // Print the QR payload bytes in yellow
+      tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+      for (size_t i = 0; i < datosQR.payloadLen; i++) {
+        tft.print((char)datosQR.payload[i]);
+      }
+
+      // Show length in white
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setCursor(15, 170);
+      tft.print("Longitud: ");
+      tft.print(datosQR.payloadLen);
+      tft.print(" bytes");
+
+      // Draw separator
+      tft.drawLine(10, 145, 310, 145, TFT_WHITE);
+
+      // Show raw payload in cyan
+      tft.setTextColor(TFT_CYAN, TFT_BLACK);
+      tft.setCursor(15, 130);
+      tft.print("[");
+      for (size_t i = 0; i < datosQR.payloadLen; i++) {
+        tft.print((char)datosQR.payload[i]);
+      }
+      tft.print("]");
+
+    } else {
+      // Invalid QR found
+      tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+      tft.setTextDatum(TC_DATUM);
+      tft.drawString("POSIBLE QR", 160, 230, 2);
+
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setTextDatum(TL_DATUM);
+      tft.setCursor(15, 190);
+      tft.println("Se encontro un posible QR,");
+      tft.setCursor(15, 172);
+      tft.println("pero no pudo decodificarse.");
     }
 
+    // Delay before next scan
     delay(1000);
   }
 
