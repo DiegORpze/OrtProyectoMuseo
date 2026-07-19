@@ -21,8 +21,8 @@
 #define Y2_GPIO_NUM         5
 
 #define VSYNC_GPIO_NUM     25
-#define HREF_GPIO_NUM      23
-#define PCLK_GPIO_NUM      22
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
 
 // =====================================================
 // Variables del lector QR
@@ -61,8 +61,6 @@ bool setupCamera() {
   config.pin_vsync = VSYNC_GPIO_NUM;
   config.pin_href = HREF_GPIO_NUM;
 
-  // Se mantienen estos nombres porque son los utilizados
-  // en el código que ya compila en su instalación.
   config.pin_sscb_sda = SIOD_GPIO_NUM;
   config.pin_sscb_scl = SIOC_GPIO_NUM;
 
@@ -70,21 +68,9 @@ bool setupCamera() {
   config.pin_reset = RESET_GPIO_NUM;
 
   config.xclk_freq_hz = 20000000;
-
-  /*
-    Para esta prueba no necesitamos RGB565.
-
-    La cámara entrega directamente una imagen en escala de grises,
-    que es exactamente lo que necesita quirc.
-  */
   config.pixel_format = PIXFORMAT_GRAYSCALE;
-
-  // 320 x 240
   config.frame_size = FRAMESIZE_QVGA;
-
-  // Solo un framebuffer para reducir el consumo de memoria.
   config.fb_count = 1;
-
   config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
   Serial.println();
@@ -101,11 +87,6 @@ bool setupCamera() {
 
   if (sensor != nullptr) {
     sensor->set_framesize(sensor, FRAMESIZE_QVGA);
-
-    /*
-      Valores neutros. Más adelante pueden modificarse
-      según la iluminación.
-    */
     sensor->set_brightness(sensor, 0);
     sensor->set_contrast(sensor, 0);
     sensor->set_saturation(sensor, 0);
@@ -129,11 +110,7 @@ bool prepareQuirc(int width, int height) {
     return true;
   }
 
-  Serial.printf(
-    "Configurando quirc para %d x %d pixeles...\n",
-    width,
-    height
-  );
+  Serial.printf("Configurando quirc para %d x %d pixeles...\n", width, height);
 
   int result = quirc_resize(qrScanner, width, height);
 
@@ -152,7 +129,7 @@ bool prepareQuirc(int width, int height) {
 }
 
 // =====================================================
-// Mostrar el contenido exacto del QR
+// Mostrar contenido del QR — SOLO texto legible ASCII
 // =====================================================
 
 void printQRData(const struct quirc_data &data, int index) {
@@ -164,30 +141,40 @@ void printQRData(const struct quirc_data &data, int index) {
   Serial.printf("Indice dentro del frame: %d\n", index);
   Serial.printf("Cantidad de bytes: %d\n", data.payload_len);
 
-  /*
-    Serial.write imprime exactamente los bytes encontrados,
-    sin modificar saltos de línea, espacios ni otros caracteres.
-  */
-  Serial.print("Texto exacto: [");
-  Serial.write(data.payload, data.payload_len);
+  // Verificar si todos los bytes son ASCII legibles (32-126)
+  bool allPrintable = true;
+  for (int i = 0; i < data.payload_len; i++) {
+    uint8_t c = data.payload[i];
+    if (c < 32 || c >= 127) {
+      allPrintable = false;
+      break;
+    }
+  }
+
+  // Solo imprime texto legible
+  Serial.print("Texto legible: [");
+  if (allPrintable && data.payload_len > 0) {
+    for (int i = 0; i < data.payload_len; i++) {
+      Serial.print((char)data.payload[i]);
+    }
+  } else {
+    Serial.print("(datos binarios - no es texto legible)");
+  }
   Serial.println("]");
 
-  /*
-    También mostramos cada byte en hexadecimal.
-    Esto permite detectar espacios, saltos de línea y caracteres ocultos.
-  */
+  // Hex para diagnostico
   Serial.print("Bytes HEX: ");
-
   for (int i = 0; i < data.payload_len; i++) {
-    if (data.payload[i] < 16) {
-      Serial.print("0");
-    }
-
+    if (data.payload[i] < 16) Serial.print("0");
     Serial.print(data.payload[i], HEX);
     Serial.print(" ");
   }
-
   Serial.println();
+
+  if (!allPrintable) {
+    Serial.println("AVISO: contiene bytes no imprimibles - probable falso positivo");
+  }
+
   Serial.println("========================================");
   Serial.println();
 }
@@ -203,10 +190,7 @@ void scanFrame(camera_fb_t *frame) {
   }
 
   if (frame->format != PIXFORMAT_GRAYSCALE) {
-    Serial.printf(
-      "ERROR: formato inesperado de imagen: %d\n",
-      frame->format
-    );
+    Serial.printf("ERROR: formato inesperado de imagen: %d\n", frame->format);
     return;
   }
 
@@ -228,11 +212,7 @@ void scanFrame(camera_fb_t *frame) {
   int scannerWidth = 0;
   int scannerHeight = 0;
 
-  uint8_t *quircBuffer = quirc_begin(
-    qrScanner,
-    &scannerWidth,
-    &scannerHeight
-  );
+  uint8_t *quircBuffer = quirc_begin(qrScanner, &scannerWidth, &scannerHeight);
 
   if (quircBuffer == nullptr) {
     Serial.println("ERROR: quirc_begin devolvio nullptr.");
@@ -241,24 +221,13 @@ void scanFrame(camera_fb_t *frame) {
 
   if (scannerWidth != width || scannerHeight != height) {
     Serial.println("ERROR: las dimensiones de quirc no coinciden.");
-
-    Serial.printf(
-      "Frame: %d x %d | quirc: %d x %d\n",
-      width,
-      height,
-      scannerWidth,
-      scannerHeight
-    );
-
+    Serial.printf("Frame: %d x %d | quirc: %d x %d\n", width, height, scannerWidth, scannerHeight);
     quirc_end(qrScanner);
     return;
   }
 
   memcpy(quircBuffer, frame->buf, expectedBytes);
 
-  /*
-    quirc_end analiza la imagen copiada y busca posibles códigos QR.
-  */
   quirc_end(qrScanner);
 
   int qrCount = quirc_count(qrScanner);
@@ -267,10 +236,7 @@ void scanFrame(camera_fb_t *frame) {
     return;
   }
 
-  Serial.printf(
-    "\nSe encontraron %d posibles QR en el frame.\n",
-    qrCount
-  );
+  Serial.printf("\nSe encontraron %d posible(s) QR en el frame.\n", qrCount);
 
   for (int i = 0; i < qrCount; i++) {
     struct quirc_code code;
@@ -280,17 +246,10 @@ void scanFrame(camera_fb_t *frame) {
 
     quirc_decode_error_t decodeResult = quirc_decode(&code, &data);
 
-    /*
-      Si la cámara entrega la imagen espejada, se prueba
-      nuevamente invirtiendo la matriz del QR.
-    */
     if (decodeResult == QUIRC_SUCCESS) {
       printQRData(data, i);
     } else {
-      Serial.printf(
-        "QR encontrado, pero no se pudo decodificar: %s\n",
-        quirc_strerror(decodeResult)
-      );
+      Serial.printf("QR #%d encontrado, pero no se pudo decodificar: %s\n", i, quirc_strerror(decodeResult));
     }
   }
 }
@@ -306,54 +265,32 @@ void setup() {
   Serial.println();
   Serial.println("========================================");
   Serial.println("PRUEBA ESP32-CAM + QUIRC");
-  Serial.println("Sin pantalla TFT");
+  Serial.println("Solo Serial Monitor - sin pantalla TFT");
   Serial.println("========================================");
 
-  Serial.printf(
-    "PSRAM detectada: %s\n",
-    psramFound() ? "SI" : "NO"
-  );
-
-  Serial.printf(
-    "Heap libre al iniciar: %u bytes\n",
-    ESP.getFreeHeap()
-  );
-
-  Serial.printf(
-    "PSRAM total: %u bytes\n",
-    ESP.getPsramSize()
-  );
-
-  Serial.printf(
-    "PSRAM libre: %u bytes\n",
-    ESP.getFreePsram()
-  );
+  Serial.printf("PSRAM detectada: %s\n", psramFound() ? "SI" : "NO");
+  Serial.printf("Heap libre al iniciar: %u bytes\n", ESP.getFreeHeap());
+  Serial.printf("PSRAM total: %u bytes\n", ESP.getPsramSize());
+  Serial.printf("PSRAM libre: %u bytes\n", ESP.getFreePsram());
 
   qrScanner = quirc_new();
 
   if (qrScanner == nullptr) {
     Serial.println("ERROR CRITICO: quirc_new fallo.");
-    Serial.println("No se pudo crear el lector QR.");
-
-    while (true) {
-      delay(1000);
-    }
+    while (true) { delay(1000); }
   }
 
   Serial.println("Objeto quirc creado correctamente.");
 
   if (!setupCamera()) {
     Serial.println("No se puede continuar sin camara.");
-
-    while (true) {
-      delay(1000);
-    }
+    while (true) { delay(1000); }
   }
 
   Serial.println();
   Serial.println("Sistema preparado.");
-  Serial.println("Coloque un codigo QR frente a la camara.");
-  Serial.println();
+  Serial.println("Solo se mostraran resultados con texto legible ASCII.");
+  Serial.println("Si ve '(datos binarios)' es un falso positivo.");
 }
 
 // =====================================================
@@ -373,24 +310,13 @@ void loop() {
 
   scanFrame(frame);
 
-  /*
-    Siempre se devuelve el framebuffer después de usarlo.
-  */
   esp_camera_fb_return(frame);
 
-  /*
-    Cada dos segundos muestra que el sistema continúa funcionando,
-    aunque todavía no haya detectado un QR.
-  */
+  // Estado cada 2 segundos
   if (millis() - lastStatusTime >= 2000) {
     lastStatusTime = millis();
-
-    Serial.printf(
-      "Buscando QR... Frames: %lu | Heap: %u | PSRAM: %u\n",
-      frameCounter,
-      ESP.getFreeHeap(),
-      ESP.getFreePsram()
-    );
+    Serial.printf("Buscando QR... Frames: %lu | QR detectados: %lu | Heap: %u | PSRAM: %u\n",
+      frameCounter, qrCounter, ESP.getFreeHeap(), ESP.getFreePsram());
   }
 
   delay(30);
