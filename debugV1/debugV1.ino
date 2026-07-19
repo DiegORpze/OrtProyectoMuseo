@@ -34,13 +34,77 @@ void mostrarError(const char* mensaje) {
   }
 }
 
-void printTFT(int y, const char* str) {
-  tft.setCursor(10, y);
-  tft.println(str);
-}
-
 void setup() {
-  // Initialize TFT display first
+  // ============================================
+  // STEP 1: Initialize Serial and Camera FIRST
+  // ============================================
+  Serial.begin(115200);
+  delay(1500);
+
+  Serial.println("Iniciando...");
+
+  // Check PSRAM
+  if (!psramFound()) {
+    Serial.println("ERROR: No se detecto PSRAM.");
+    // Can't show on TFT yet
+    while (true) delay(1000);
+  }
+  Serial.println("PSRAM detectada.");
+
+  // CAMERA POWER-ON SEQUENCE FOR ESP32-CAM AI-THINKER
+  // GPIO 32 is PWDN for the camera
+  pinMode(32, OUTPUT);
+  digitalWrite(32, HIGH);  // Power down camera first
+  delay(100);
+  digitalWrite(32, LOW);   // Power up camera
+  delay(100);
+  Serial.println("Camera PWDN sequence done.");
+
+  // Initialize camera
+  Serial.println("Inicializando camara...");
+  lectorQR.setDebug(false);
+
+  QRCodeReaderSetupErr resultado = lectorQR.setup();
+  Serial.println("Setup() retorno.");
+
+  if (resultado == SETUP_NO_PSRAM_ERROR) {
+    Serial.println("ERROR: La biblioteca no encontro PSRAM.");
+    while (true) delay(1000);
+  }
+
+  if (resultado == SETUP_CAMERA_INIT_ERROR) {
+    Serial.println("ERROR: No se pudo inicializar la camara.");
+    while (true) delay(1000);
+  }
+
+  if (resultado != SETUP_OK) {
+    Serial.println("ERROR: Error desconocido al iniciar el lector.");
+    while (true) delay(1000);
+  }
+
+  Serial.println("Configurando sensor...");
+
+  // Get sensor and configure mirror
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor == nullptr) {
+    Serial.println("ERROR: No se pudo obtener el sensor.");
+    while (true) delay(1000);
+  }
+
+  int resultadoEspejo = sensor->set_hmirror(sensor, 1);
+  if (resultadoEspejo == 0) {
+    Serial.println("Imagen invertida OK.");
+  } else {
+    Serial.println("Error al invertir imagen.");
+  }
+
+  delay(1000);
+  lectorQR.beginOnCore(1);
+  Serial.println("Camara inicializada correctamente.");
+
+  // ============================================
+  // STEP 2: Now initialize TFT display
+  // ============================================
   tft.init();
   tft.setRotation(1);  // Landscape orientation for 320x240
   tft.fillScreen(TFT_BLACK);
@@ -50,6 +114,10 @@ void setup() {
   tft.setFreeFont(&FreeMono9pt7b);
   tft.setTextDatum(TL_DATUM);
 
+  // ============================================
+  // STEP 3: Display status messages on TFT
+  // ============================================
+
   // Welcome screen
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextDatum(TC_DATUM);
@@ -58,90 +126,24 @@ void setup() {
   delay(2000);
   tft.fillScreen(TFT_BLACK);
 
-  // The Monitor Serie must also be configured at 115200 for camera lib.
-  Serial.begin(115200);
-  delay(1500);  // Original timing - 1500ms for serial init
-
-  printTFT(10, "Iniciando...");
+  // Show PSRAM status
+  tft.setTextDatum(TL_DATUM);
+  tft.setCursor(10, 10);
+  tft.println("PSRAM detectada.");
   delay(500);
 
-  // Check PSRAM first
-  if (!psramFound()) {
-    mostrarError("No se detecto PSRAM.");
-  }
-
-  printTFT(30, "PSRAM detectada.");
-  delay(500);
-
-  printTFT(50, "Inicializando camara...");
-  delay(500);
-
-  // CAMERA POWER-ON SEQUENCE FOR ESP32-CAM AI-THINKER
-  // GPIO 32 is PWDN for the camera - must be set correctly
-  pinMode(32, OUTPUT);
-  digitalWrite(32, HIGH);  // Power down camera first
-  delay(100);
-  digitalWrite(32, LOW);   // Power up camera
-  delay(100);
-
-  printTFT(70, "Camera PWDN sequence");
-  delay(200);
-
-  // Disable debug output from the QR library
-  lectorQR.setDebug(false);
-
-  printTFT(90, "Llamando setup()...");
-  delay(200);
-
-  // This is where it hangs - camera setup
-  QRCodeReaderSetupErr resultado = lectorQR.setup();
-
-  printTFT(110, "Setup() retorno.");
-  delay(200);
-
-  if (resultado == SETUP_NO_PSRAM_ERROR) {
-    mostrarError("La biblioteca no encontro PSRAM.");
-  }
-
-  if (resultado == SETUP_CAMERA_INIT_ERROR) {
-    mostrarError("No se pudo inicializar la camara.");
-  }
-
-  if (resultado != SETUP_OK) {
-    mostrarError("Error desconocido al iniciar el lector.");
-  }
-
-  printTFT(130, "Configurando sensor...");
-  delay(500);
-
-  // Get sensor and configure mirror
-  sensor_t *sensor = esp_camera_sensor_get();
-
-  if (sensor == nullptr) {
-    mostrarError("No se pudo obtener el sensor de la camara.");
-  }
-
-  int resultadoEspejo = sensor->set_hmirror(sensor, 1);
-
-  if (resultadoEspejo == 0) {
-    printTFT(150, "Imagen invertida OK.");
-  } else {
-    printTFT(150, "Error al invertir.");
-  }
-
+  tft.setCursor(10, 30);
+  tft.println("Camara inicializada");
+  tft.setCursor(10, 48);
+  tft.println("correctamente.");
   delay(1000);
-  lectorQR.beginOnCore(1);
 
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextDatum(TC_DATUM);
-  tft.drawString("Camara inicializada", 160, 80, 2);
-  tft.drawString("correctamente.", 160, 105, 2);
-  delay(1500);
-
+  // Final ready screen
   tft.fillScreen(TFT_BLACK);
   tft.setTextDatum(TC_DATUM);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
   tft.drawString("Lector QR preparado.", 160, 90, 2);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.drawString("Coloque un codigo QR", 160, 130, 2);
   tft.drawString("frente a la camara.", 160, 150, 2);
 }
