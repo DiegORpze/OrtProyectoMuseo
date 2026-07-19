@@ -118,23 +118,23 @@ void setup() {
   // STEP 3: Display status messages on TFT
   // ============================================
 
-  // Welcome screen
+  // Welcome screen (rotation 3 = 180° flip, adjust Y coordinates)
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextDatum(TC_DATUM);
-  tft.drawString("PRUEBA DE LECTURA", 160, 80, 2);
-  tft.drawString("DE CODIGOS QR", 160, 110, 2);
+  tft.drawString("PRUEBA DE LECTURA", 160, 40, 2);
+  tft.drawString("DE CODIGOS QR", 160, 70, 2);
   delay(2000);
   tft.fillScreen(TFT_BLACK);
 
-  // Show PSRAM status
+  // Show PSRAM status (bottom-left in rotation 3 = top-left visually flipped)
   tft.setTextDatum(TL_DATUM);
-  tft.setCursor(10, 10);
+  tft.setCursor(10, 195);  // Flipped Y position
   tft.println("PSRAM detectada.");
   delay(500);
 
-  tft.setCursor(10, 30);
+  tft.setCursor(10, 175);  // Flipped Y position
   tft.println("Camara inicializada");
-  tft.setCursor(10, 48);
+  tft.setCursor(10, 157);  // Flipped Y position
   tft.println("correctamente.");
   delay(1000);
 
@@ -142,10 +142,10 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   tft.setTextDatum(TC_DATUM);
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.drawString("Lector QR preparado.", 160, 90, 2);
+  tft.drawString("Lector QR preparado.", 160, 150, 2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("Coloque un codigo QR", 160, 130, 2);
-  tft.drawString("frente a la camara.", 160, 150, 2);
+  tft.drawString("Coloque un codigo QR", 160, 110, 2);
+  tft.drawString("frente a la camara.", 160, 90, 2);
 }
 
 void loop() {
@@ -154,66 +154,15 @@ void loop() {
   // Check for QR code with 100ms timeout
   if (lectorQR.receiveQrCode(&datosQR, 100)) {
     tft.fillScreen(TFT_BLACK);
-    tft.setFreeFont(&FreeMono9pt7b);
-    tft.setTextDatum(TL_DATUM);
-
-    // Draw a border
-    tft.drawRect(2, 2, 316, 236, TFT_WHITE);
-    tft.drawLine(10, 28, 310, 28, TFT_WHITE);
 
     if (datosQR.valid) {
-      // QR Content header
-      tft.setTextColor(TFT_GREEN, TFT_BLACK);
-      tft.setTextDatum(TC_DATUM);
-      tft.drawString("QR DETECTADO", 160, 8, 2);
-
+      // Display ONLY the payload - centered, large text
       tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.setTextDatum(TL_DATUM);
-
-      // Show "CONTENIDO:"
-      tft.setCursor(15, 40);
-      tft.print("CONTENIDO: ");
-
-      // Print the QR payload bytes in yellow
-      tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-      for (size_t i = 0; i < datosQR.payloadLen; i++) {
-        tft.print((char)datosQR.payload[i]);
-      }
-
-      // Show length in white
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.setCursor(15, 68);
-      tft.print("Longitud: ");
-      tft.print(datosQR.payloadLen);
-      tft.print(" bytes");
-
-      // Draw separator
-      tft.drawLine(10, 95, 310, 95, TFT_WHITE);
-
-      // Show raw payload in cyan
-      tft.setTextColor(TFT_CYAN, TFT_BLACK);
-      tft.setCursor(15, 108);
-      tft.print("[");
-      for (size_t i = 0; i < datosQR.payloadLen; i++) {
-        tft.print((char)datosQR.payload[i]);
-      }
-      tft.print("]");
-
-    } else {
-      // Invalid QR found
-      tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-      tft.setTextDatum(TC_DATUM);
-      tft.drawString("POSIBLE QR", 160, 8, 2);
-
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.setTextDatum(TL_DATUM);
-      tft.setCursor(15, 45);
-      tft.println("Se encontro un posible QR,");
-      tft.setCursor(15, 63);
-      tft.println("pero no pudo decodificarse.");
+      tft.setFreeFont(&FreeMono9pt7b);
+      tft.setTextDatum(CC_DATUM);  // Center text
+      tft.drawString((char*)datosQR.payload, 160, 120, 2);
     }
 
-    // Delay before next scan
     delay(1000);
   }
 
