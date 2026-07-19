@@ -151,14 +151,14 @@ void loop() {
 
   // 3. If Core 0 successfully read a NEW QR code, update our text variable
   if (update_ui) {
-    String payload = String(new_payload);  // read FIRST before clearing flag
     update_ui = false;
+    String payload = String(new_payload);
 
-    // DEBUG: This white box at the top will show you EXACTLY what the camera read!
+    // Display the scanned QR payload at the top
     tft.fillRect(0, 0, 240, 20, TFT_WHITE);
     tft.setTextColor(TFT_BLACK, TFT_WHITE);
-    tft.drawString("Raw: " + payload, 2, 2, 2);
-    
+    tft.drawString(payload, 2, 2, 2);
+
     // --- MUSEUM LOGIC HERE ---
     if (payload == "MonaLisa") {
       current_painting_text = "Painting: Mona Lisa";
@@ -170,7 +170,6 @@ void loop() {
       current_painting_text = "Painting: The Scream";
     }
     else {
-      // If it reads a QR code you didn't program, show the raw text
       current_painting_text = "Read: " + payload;
     }
   }
