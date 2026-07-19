@@ -198,10 +198,18 @@ void scanFrame(camera_fb_t *frame) {
   int height = frame->height;
   size_t expectedBytes = width * height;
 
+  // DEBUG: mostrar info del frame
+  Serial.printf("Frame: %dx%d, %u bytes\n", width, height, (unsigned int)frame->len);
+
   if (frame->len < expectedBytes) {
     Serial.println("ERROR: el framebuffer es mas pequeno de lo esperado.");
     Serial.printf("Recibido: %u bytes\n", (unsigned int)frame->len);
     Serial.printf("Esperado: %u bytes\n", (unsigned int)expectedBytes);
+    return;
+  }
+
+  if (frame->buf == nullptr) {
+    Serial.println("ERROR: frame->buf es nullptr.");
     return;
   }
 
@@ -236,7 +244,7 @@ void scanFrame(camera_fb_t *frame) {
     return;
   }
 
-  Serial.printf("\nSe encontraron %d posible(s) QR en el frame.\n", qrCount);
+  Serial.printf("Se encontraron %d posible(s) QR en el frame.\n", qrCount);
 
   for (int i = 0; i < qrCount; i++) {
     struct quirc_code code;
@@ -287,6 +295,19 @@ void setup() {
     while (true) { delay(1000); }
   }
 
+  // Dejar que la camara se estabilice con 3 frames dummy
+  Serial.println("Esperando que la camara se estabilice...");
+  for (int i = 0; i < 3; i++) {
+    camera_fb_t *dummy = esp_camera_fb_get();
+    if (dummy) {
+      Serial.printf("Frame dummy %d: %dx%d, %u bytes\n", i+1, dummy->width, dummy->height, (unsigned int)dummy->len);
+      esp_camera_fb_return(dummy);
+    } else {
+      Serial.printf("Frame dummy %d: NULL\n", i+1);
+    }
+    delay(100);
+  }
+
   Serial.println();
   Serial.println("Sistema preparado.");
   Serial.println("Solo se mostraran resultados con texto legible ASCII.");
@@ -301,7 +322,7 @@ void loop() {
   camera_fb_t *frame = esp_camera_fb_get();
 
   if (frame == nullptr) {
-    Serial.println("ERROR: esp_camera_fb_get fallo.");
+    Serial.println("ERROR: esp_camera_fb_get fallo (frame null).");
     delay(100);
     return;
   }
