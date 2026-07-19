@@ -32,19 +32,6 @@ const char *getPaintingPrompt(const char *payload) {
   return nullptr;
 }
 
-void showResult(const char *prompt) {
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString(prompt, 160, 110, 4);
-}
-
-void drainCameraFrames() {
-  for (int i = 0; i < 5; i++) {
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (fb) esp_camera_fb_return(fb);
-  }
-}
-
 void setupCamera() {
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -69,7 +56,7 @@ void setupCamera() {
   config.pixel_format = PIXFORMAT_RGB565;
   config.frame_size = FRAMESIZE_QVGA;
   config.fb_count = 2;
-  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  config.grab_mode = CAMERA_GRAB_LATEST;
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
@@ -140,63 +127,34 @@ bool scanQR(camera_fb_t *fb) {
   Serial.println(tmp);
 
   const char *prompt = getPaintingPrompt(tmp);
-  showResult(prompt ? prompt : tmp);
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString(prompt ? prompt : tmp, 160, 110, 4);
+
   return true;
 }
 
 void loop() {
   static int frame_counter = 0;
-  static bool in_result = false;
   static const int FRAMES_BETWEEN_SCANS = 150;
 
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) return;
 
-  // Always display the current frame
   tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
 
-  if (!in_result) {
-    frame_counter++;
+  frame_counter++;
+  if (frame_counter >= FRAMES_BETWEEN_SCANS) {
+    frame_counter = 0;
 
-    // Time to scan?
-    if (frame_counter >= FRAMES_BETWEEN_SCANS) {
-      frame_counter = 0;
+    esp_camera_fb_return(fb);
+    esp_camera_deinit();
 
-      // Return frame and stop camera before scanning
-      esp_camera_fb_return(fb);
-      esp_camera_deinit();
+    scanQR(fb);
 
-      bool found = scanQR(fb);
-
-      if (found) {
-        in_result = true;
-        delay(5000);
-
-        // Done showing result — clear screen
-        tft.fillScreen(TFT_BLACK);
-
-        // Reinit camera
-        esp_camera_deinit(); // no-op safety
-        setupCamera();
-
-        // Drain any buffered frames from the fresh camera init
-        drainCameraFrames();
-
-        // Small settle time for camera DMA to stabilize
-        delay(100);
-
-        // Drain again after settle
-        drainCameraFrames();
-
-        in_result = false;
-      } else {
-        // No QR found — reinit and continue
-        esp_camera_deinit();
-        setupCamera();
-        drainCameraFrames();
-      }
-      return;
-    }
+    esp_camera_deinit();
+    setupCamera();
+    return;
   }
 
   esp_camera_fb_return(fb);
