@@ -34,6 +34,12 @@ void mostrarError(const char* mensaje) {
   }
 }
 
+void printDebug(const char* str) {
+  Serial.println(str);  // Also print to Serial for debugging
+  tft.setCursor(10, 150);
+  tft.println(str);
+}
+
 void setup() {
   // Initialize TFT display first
   tft.init();
@@ -55,9 +61,9 @@ void setup() {
 
   // The Monitor Serie must also be configured at 115200 for camera lib.
   Serial.begin(115200);
-  delay(500);
+  delay(1500);  // Original timing - 1500ms for serial init
 
-  // Show setup steps on screen using left-aligned text
+  // Show setup steps on screen
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setFreeFont(&FreeMono9pt7b);
   tft.setTextDatum(TL_DATUM);
@@ -80,9 +86,19 @@ void setup() {
   tft.println("Inicializando camara...");
   delay(500);
 
+  // Disable debug output from the QR library
   lectorQR.setDebug(false);
 
+  tft.setCursor(10, 70);
+  tft.println("Llamando setup()...");
+  delay(500);
+
+  // This is where it likely hangs - camera setup
   QRCodeReaderSetupErr resultado = lectorQR.setup();
+
+  tft.setCursor(10, 90);
+  tft.println("Setup() retorno.");
+  delay(500);
 
   if (resultado == SETUP_NO_PSRAM_ERROR) {
     mostrarError("La biblioteca no encontro PSRAM.");
@@ -96,7 +112,7 @@ void setup() {
     mostrarError("Error desconocido al iniciar el lector.");
   }
 
-  tft.setCursor(10, 70);
+  tft.setCursor(10, 110);
   tft.println("Configurando sensor...");
   delay(500);
 
@@ -113,14 +129,14 @@ void setup() {
   int resultadoEspejo = sensor->set_hmirror(sensor, 1);
 
   if (resultadoEspejo == 0) {
-    tft.setCursor(10, 90);
+    tft.setCursor(10, 130);
     tft.println("Imagen horizontalmente");
-    tft.setCursor(10, 108);
+    tft.setCursor(10, 148);
     tft.println("invertida para prueba.");
   } else {
-    tft.setCursor(10, 90);
+    tft.setCursor(10, 130);
     tft.println("No se pudo cambiar la");
-    tft.setCursor(10, 108);
+    tft.setCursor(10, 148);
     tft.println("orientacion horizontal.");
   }
 
