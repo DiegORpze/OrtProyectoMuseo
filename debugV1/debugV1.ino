@@ -34,9 +34,8 @@ void mostrarError(const char* mensaje) {
   }
 }
 
-void printDebug(const char* str) {
-  Serial.println(str);  // Also print to Serial for debugging
-  tft.setCursor(10, 150);
+void printTFT(int y, const char* str) {
+  tft.setCursor(10, y);
   tft.println(str);
 }
 
@@ -63,42 +62,42 @@ void setup() {
   Serial.begin(115200);
   delay(1500);  // Original timing - 1500ms for serial init
 
-  // Show setup steps on screen
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setFreeFont(&FreeMono9pt7b);
-  tft.setTextDatum(TL_DATUM);
-
-  // Step 1: PSRAM check
-  tft.setCursor(10, 10);
-  tft.println("Iniciando...");
+  printTFT(10, "Iniciando...");
   delay(500);
 
-  // The library needs PSRAM.
+  // Check PSRAM first
   if (!psramFound()) {
     mostrarError("No se detecto PSRAM.");
   }
 
-  tft.setCursor(10, 30);
-  tft.println("PSRAM detectada.");
+  printTFT(30, "PSRAM detectada.");
   delay(500);
 
-  tft.setCursor(10, 50);
-  tft.println("Inicializando camara...");
+  printTFT(50, "Inicializando camara...");
   delay(500);
+
+  // CAMERA POWER-ON SEQUENCE FOR ESP32-CAM AI-THINKER
+  // GPIO 32 is PWDN for the camera - must be set correctly
+  pinMode(32, OUTPUT);
+  digitalWrite(32, HIGH);  // Power down camera first
+  delay(100);
+  digitalWrite(32, LOW);   // Power up camera
+  delay(100);
+
+  printTFT(70, "Camera PWDN sequence");
+  delay(200);
 
   // Disable debug output from the QR library
   lectorQR.setDebug(false);
 
-  tft.setCursor(10, 70);
-  tft.println("Llamando setup()...");
-  delay(500);
+  printTFT(90, "Llamando setup()...");
+  delay(200);
 
-  // This is where it likely hangs - camera setup
+  // This is where it hangs - camera setup
   QRCodeReaderSetupErr resultado = lectorQR.setup();
 
-  tft.setCursor(10, 90);
-  tft.println("Setup() retorno.");
-  delay(500);
+  printTFT(110, "Setup() retorno.");
+  delay(200);
 
   if (resultado == SETUP_NO_PSRAM_ERROR) {
     mostrarError("La biblioteca no encontro PSRAM.");
@@ -112,14 +111,10 @@ void setup() {
     mostrarError("Error desconocido al iniciar el lector.");
   }
 
-  tft.setCursor(10, 110);
-  tft.println("Configurando sensor...");
+  printTFT(130, "Configurando sensor...");
   delay(500);
 
-  /*
-    Inicia la tarea interna que captura imagenes
-    y busca codigos QR.
-  */
+  // Get sensor and configure mirror
   sensor_t *sensor = esp_camera_sensor_get();
 
   if (sensor == nullptr) {
@@ -129,15 +124,9 @@ void setup() {
   int resultadoEspejo = sensor->set_hmirror(sensor, 1);
 
   if (resultadoEspejo == 0) {
-    tft.setCursor(10, 130);
-    tft.println("Imagen horizontalmente");
-    tft.setCursor(10, 148);
-    tft.println("invertida para prueba.");
+    printTFT(150, "Imagen invertida OK.");
   } else {
-    tft.setCursor(10, 130);
-    tft.println("No se pudo cambiar la");
-    tft.setCursor(10, 148);
-    tft.println("orientacion horizontal.");
+    printTFT(150, "Error al invertir.");
   }
 
   delay(1000);
@@ -160,10 +149,7 @@ void setup() {
 void loop() {
   QRCodeData datosQR = {};
 
-  /*
-    Comprueba durante un maximo de 100 ms
-    si la tarea de lectura encontro un QR.
-  */
+  // Check for QR code with 100ms timeout
   if (lectorQR.receiveQrCode(&datosQR, 100)) {
     tft.fillScreen(TFT_BLACK);
     tft.setFreeFont(&FreeMono9pt7b);
@@ -225,10 +211,7 @@ void loop() {
       tft.println("pero no pudo decodificarse.");
     }
 
-    /*
-      Evita llenar demasiado rapido el display
-      si el QR continua delante de la camara.
-    */
+    // Delay before next scan
     delay(1000);
   }
 
