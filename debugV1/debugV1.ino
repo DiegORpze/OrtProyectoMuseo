@@ -106,7 +106,7 @@ void setup() {
   // STEP 2: Now initialize TFT display
   // ============================================
   tft.init();
-  tft.setRotation(1);  // Landscape orientation for 320x240
+  tft.setRotation(3);  // Landscape orientation for 320x240
   tft.fillScreen(TFT_BLACK);
 
   // Set default font and colors
