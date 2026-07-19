@@ -194,6 +194,7 @@ void scanFrame(camera_fb_t *frame) {
     return;
   }
 
+<<<<<<< HEAD
   int width = frame->width;
   int height = frame->height;
   size_t expectedBytes = width * height;
@@ -203,6 +204,27 @@ void scanFrame(camera_fb_t *frame) {
     Serial.printf("Recibido: %u bytes\n", (unsigned int)frame->len);
     Serial.printf("Esperado: %u bytes\n", (unsigned int)expectedBytes);
     return;
+=======
+  // 3. If Core 0 successfully read a NEW QR code, update our text variable
+  if (update_ui) {
+    update_ui = false; // Clear flag
+    String payload = String(new_payload);
+    
+    // --- MUSEUM LOGIC HERE ---
+    if (payload == "MonaLisa") {
+      current_painting_text = "Painting: Mona Lisa";
+    }
+    else if (payload == "StarryNight") {
+      current_painting_text = "Painting: Starry Night";
+    }
+    else if (payload == "TheScream") {
+      current_painting_text = "Painting: The Scream";
+    }
+    else {
+      // If it reads a QR code you didn't program, show the raw text
+      current_painting_text = "Read: " + payload;
+    }
+>>>>>>> parent of 3f94afa (VERSION ORIGINAL SAVE)
   }
 
   if (!prepareQuirc(width, height)) {
@@ -214,6 +236,7 @@ void scanFrame(camera_fb_t *frame) {
 
   uint8_t *quircBuffer = quirc_begin(qrScanner, &scannerWidth, &scannerHeight);
 
+<<<<<<< HEAD
   if (quircBuffer == nullptr) {
     Serial.println("ERROR: quirc_begin devolvio nullptr.");
     return;
@@ -248,6 +271,28 @@ void scanFrame(camera_fb_t *frame) {
 
     if (decodeResult == QUIRC_SUCCESS) {
       printQRData(data, i);
+=======
+      int count = quirc_count(qr);
+      if (count > 0) {
+        struct quirc_code code;
+        struct quirc_data data;
+        quirc_extract(qr, 0, &code);
+        
+        if (quirc_decode(&code, &data) == QUIRC_SUCCESS) {
+          String payload = String((const char *)data.payload);
+          
+          // Only trigger a UI update if it's a different QR code than last time
+          if (payload != last_painting_name) {
+            last_painting_name = payload;
+            strncpy(new_payload, (const char *)data.payload, 63);
+            new_payload[63] = '\0'; 
+            update_ui = true; 
+          }
+        }
+      }
+      // Tell Core 1 we are done and ready for the next frame
+      frame_ready_for_scan = false;
+>>>>>>> parent of 3f94afa (VERSION ORIGINAL SAVE)
     } else {
       Serial.printf("QR #%d encontrado, pero no se pudo decodificar: %s\n", i, quirc_strerror(decodeResult));
     }
