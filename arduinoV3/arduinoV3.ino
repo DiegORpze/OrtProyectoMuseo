@@ -1,47 +1,52 @@
 #include "esp_camera.h"
-#include <SPI.h>
-#include <TFT_eSPI.h>
 #include <quirc.h>
 
-#define PWDN_GPIO_NUM     32
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM      0
-#define SIOD_GPIO_NUM     26
-#define SIOC_GPIO_NUM     27
-#define Y9_GPIO_NUM       35
-#define Y8_GPIO_NUM       34
-#define Y7_GPIO_NUM       39
-#define Y6_GPIO_NUM       36
-#define Y5_GPIO_NUM       21
-#define Y4_GPIO_NUM       19
-#define Y3_GPIO_NUM       18
-#define Y2_GPIO_NUM        5
-#define VSYNC_GPIO_NUM    25
-#define HREF_GPIO_NUM     23
-#define PCLK_GPIO_NUM     22
+// =====================================================
+// Pines de cámara ESP32-CAM AI-Thinker
+// =====================================================
 
-TFT_eSPI tft = TFT_eSPI();
+#define PWDN_GPIO_NUM      32
+#define RESET_GPIO_NUM     -1
+#define XCLK_GPIO_NUM       0
+#define SIOD_GPIO_NUM      26
+#define SIOC_GPIO_NUM      27
 
-static uint8_t *grayscale_buf = nullptr;
-struct quirc *qr = nullptr;
+#define Y9_GPIO_NUM        35
+#define Y8_GPIO_NUM        34
+#define Y7_GPIO_NUM        39
+#define Y6_GPIO_NUM        36
+#define Y5_GPIO_NUM        21
+#define Y4_GPIO_NUM        19
+#define Y3_GPIO_NUM        18
+#define Y2_GPIO_NUM         5
 
-const char *getPaintingPrompt(const char *payload) {
-  if (strcmp(payload, "MonaLisa") == 0)    return "Mona Lisa - Da Vinci";
-  if (strcmp(payload, "StarryNight") == 0)  return "Starry Night - Van Gogh";
-  if (strcmp(payload, "TheScream") == 0)    return "The Scream - Munch";
-  return nullptr;
-}
+#define VSYNC_GPIO_NUM     25
+#define HREF_GPIO_NUM      23
+#define PCLK_GPIO_NUM      22
 
-void showResult(const char *prompt) {
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString(prompt, 160, 110, 4);
-}
+// =====================================================
+// Variables del lector QR
+// =====================================================
 
-void setupCamera() {
-  camera_config_t config;
+struct quirc *qrScanner = nullptr;
+
+int quircWidth = 0;
+int quircHeight = 0;
+
+unsigned long lastStatusTime = 0;
+unsigned long frameCounter = 0;
+unsigned long qrCounter = 0;
+
+// =====================================================
+// Inicialización de la cámara
+// =====================================================
+
+bool setupCamera() {
+  camera_config_t config = {};
+
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
+
   config.pin_d0 = Y2_GPIO_NUM;
   config.pin_d1 = Y3_GPIO_NUM;
   config.pin_d2 = Y4_GPIO_NUM;
@@ -50,135 +55,346 @@ void setupCamera() {
   config.pin_d5 = Y7_GPIO_NUM;
   config.pin_d6 = Y8_GPIO_NUM;
   config.pin_d7 = Y9_GPIO_NUM;
+
   config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_sscb_sda = SIOD_GPIO_NUM;
-  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pclk = PCLK_GPIO_NUM;
   config.pin_vsync = VSYNC_GPIO_NUM;
   config.pin_href = HREF_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
+
+  // Se mantienen estos nombres porque son los utilizados
+  // en el código que ya compila en su instalación.
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
+
   config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_RGB565;
+
+  /*
+    Para esta prueba no necesitamos RGB565.
+
+    La cámara entrega directamente una imagen en escala de grises,
+    que es exactamente lo que necesita quirc.
+  */
+  config.pixel_format = PIXFORMAT_GRAYSCALE;
+
+  // 320 x 240
   config.frame_size = FRAMESIZE_QVGA;
-  config.fb_count = 2;
-  config.grab_mode = CAMERA_GRAB_LATEST;
 
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    tft.fillScreen(TFT_RED);
-    tft.drawString("Cam Error", 10, 10, 2);
-  }
-}
+  // Solo un framebuffer para reducir el consumo de memoria.
+  config.fb_count = 1;
 
-void setup() {
-  Serial.begin(230400);
-  delay(1000);
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
 
-  pinMode(12, OUTPUT);
-  digitalWrite(12, LOW);
-  delay(50);
-  digitalWrite(12, HIGH);
-  delay(150);
+  Serial.println();
+  Serial.println("Inicializando camara...");
 
-  tft.init();
-  tft.setRotation(2);
-  tft.fillScreen(TFT_BLACK);
-  tft.setSwapBytes(false);
+  esp_err_t error = esp_camera_init(&config);
 
-  grayscale_buf = (uint8_t *)ps_malloc(320 * 240);
-
-  qr = quirc_new();
-  if (qr) quirc_resize(qr, 320, 240);
-
-  setupCamera();
-  Serial.println("Ready");
-}
-
-bool scanQR(camera_fb_t *fb) {
-  uint8_t *src = fb->buf;
-  for (int i = 0; i < 320 * 240; i++) {
-    uint16_t pixel = (src[i*2] << 8) | src[i*2+1];
-    uint8_t r5 = (pixel >> 11) & 0x1F;
-    uint8_t g6 = (pixel >> 5)  & 0x3F;
-    uint8_t b5 =  pixel        & 0x1F;
-    uint8_t r = (r5 << 3) | (r5 >> 2);
-    uint8_t g = (g6 << 2) | (g6 >> 4);
-    uint8_t b = (b5 << 3) | (b5 >> 2);
-    grayscale_buf[i] = (r * 77 + g * 150 + b * 29) >> 8;
+  if (error != ESP_OK) {
+    Serial.printf("ERROR al inicializar la camara: 0x%X\n", error);
+    return false;
   }
 
-  int w = 0, h = 0;
-  uint8_t *qbuf = quirc_begin(qr, &w, &h);
-  if (qbuf) memcpy(qbuf, grayscale_buf, 320 * 240);
-  quirc_end(qr);
+  sensor_t *sensor = esp_camera_sensor_get();
 
-  if (quirc_count(qr) == 0) return false;
+  if (sensor != nullptr) {
+    sensor->set_framesize(sensor, FRAMESIZE_QVGA);
 
-  struct quirc_code code;
-  struct quirc_data data;
-  quirc_extract(qr, 0, &code);
-  if (quirc_decode(&code, &data) != QUIRC_SUCCESS) return false;
-
-  int len = data.payload_len;
-  if (len > 63) len = 63;
-  char tmp[64];
-  memcpy(tmp, data.payload, len);
-  tmp[len] = '\0';
-  for (int i = 0; i < len; i++) {
-    if (tmp[i] < 32) { tmp[i] = '\0'; break; }
+    /*
+      Valores neutros. Más adelante pueden modificarse
+      según la iluminación.
+    */
+    sensor->set_brightness(sensor, 0);
+    sensor->set_contrast(sensor, 0);
+    sensor->set_saturation(sensor, 0);
   }
 
-  Serial.print("QR: ");
-  Serial.println(tmp);
-
-  const char *prompt = getPaintingPrompt(tmp);
-  showResult(prompt ? prompt : tmp);
+  Serial.println("Camara inicializada correctamente.");
   return true;
 }
 
-void loop() {
-  static int frame_counter = 0;
-  static bool in_result = false;
-  static const int FRAMES_BETWEEN_SCANS = 150;
+// =====================================================
+// Ajustar quirc al tamaño real del frame
+// =====================================================
 
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) return;
+bool prepareQuirc(int width, int height) {
+  if (qrScanner == nullptr) {
+    Serial.println("ERROR: qrScanner es nullptr.");
+    return false;
+  }
 
-  tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
+  if (quircWidth == width && quircHeight == height) {
+    return true;
+  }
 
-  if (!in_result) {
-    frame_counter++;
+  Serial.printf(
+    "Configurando quirc para %d x %d pixeles...\n",
+    width,
+    height
+  );
 
-    if (frame_counter >= FRAMES_BETWEEN_SCANS) {
-      frame_counter = 0;
+  int result = quirc_resize(qrScanner, width, height);
 
-      esp_camera_fb_return(fb);
-      esp_camera_deinit();
+  if (result < 0) {
+    Serial.println("ERROR: quirc_resize fallo.");
+    Serial.printf("Heap libre: %u bytes\n", ESP.getFreeHeap());
+    Serial.printf("PSRAM libre: %u bytes\n", ESP.getFreePsram());
+    return false;
+  }
 
-      bool found = scanQR(fb);
+  quircWidth = width;
+  quircHeight = height;
 
-      if (found) {
-        // DEBUG: screen turns GREEN = QR was scanned successfully
-        tft.fillScreen(TFT_GREEN);
-        delay(5000);
-        tft.fillScreen(TFT_BLACK);
+  Serial.println("quirc configurado correctamente.");
+  return true;
+}
 
-        esp_camera_deinit();
-        setupCamera();
-        in_result = false;
-      } else {
-        // DEBUG: screen turns RED = scan done but no QR found
-        tft.fillScreen(TFT_RED);
-        delay(500);
-        tft.fillScreen(TFT_BLACK);
+// =====================================================
+// Mostrar el contenido exacto del QR
+// =====================================================
 
-        esp_camera_deinit();
-        setupCamera();
-      }
-      return;
+void printQRData(const struct quirc_data &data, int index) {
+  qrCounter++;
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.printf("QR DECODIFICADO #%lu\n", qrCounter);
+  Serial.printf("Indice dentro del frame: %d\n", index);
+  Serial.printf("Cantidad de bytes: %d\n", data.payload_len);
+
+  /*
+    Serial.write imprime exactamente los bytes encontrados,
+    sin modificar saltos de línea, espacios ni otros caracteres.
+  */
+  Serial.print("Texto exacto: [");
+  Serial.write(data.payload, data.payload_len);
+  Serial.println("]");
+
+  /*
+    También mostramos cada byte en hexadecimal.
+    Esto permite detectar espacios, saltos de línea y caracteres ocultos.
+  */
+  Serial.print("Bytes HEX: ");
+
+  for (int i = 0; i < data.payload_len; i++) {
+    if (data.payload[i] < 16) {
+      Serial.print("0");
+    }
+
+    Serial.print(data.payload[i], HEX);
+    Serial.print(" ");
+  }
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println();
+}
+
+// =====================================================
+// Escanear un frame
+// =====================================================
+
+void scanFrame(camera_fb_t *frame) {
+  if (frame == nullptr) {
+    Serial.println("ERROR: frame nulo.");
+    return;
+  }
+
+  if (frame->format != PIXFORMAT_GRAYSCALE) {
+    Serial.printf(
+      "ERROR: formato inesperado de imagen: %d\n",
+      frame->format
+    );
+    return;
+  }
+
+  int width = frame->width;
+  int height = frame->height;
+  size_t expectedBytes = width * height;
+
+  if (frame->len < expectedBytes) {
+    Serial.println("ERROR: el framebuffer es mas pequeno de lo esperado.");
+    Serial.printf("Recibido: %u bytes\n", (unsigned int)frame->len);
+    Serial.printf("Esperado: %u bytes\n", (unsigned int)expectedBytes);
+    return;
+  }
+
+  if (!prepareQuirc(width, height)) {
+    return;
+  }
+
+  int scannerWidth = 0;
+  int scannerHeight = 0;
+
+  uint8_t *quircBuffer = quirc_begin(
+    qrScanner,
+    &scannerWidth,
+    &scannerHeight
+  );
+
+  if (quircBuffer == nullptr) {
+    Serial.println("ERROR: quirc_begin devolvio nullptr.");
+    return;
+  }
+
+  if (scannerWidth != width || scannerHeight != height) {
+    Serial.println("ERROR: las dimensiones de quirc no coinciden.");
+
+    Serial.printf(
+      "Frame: %d x %d | quirc: %d x %d\n",
+      width,
+      height,
+      scannerWidth,
+      scannerHeight
+    );
+
+    quirc_end(qrScanner);
+    return;
+  }
+
+  memcpy(quircBuffer, frame->buf, expectedBytes);
+
+  /*
+    quirc_end analiza la imagen copiada y busca posibles códigos QR.
+  */
+  quirc_end(qrScanner);
+
+  int qrCount = quirc_count(qrScanner);
+
+  if (qrCount == 0) {
+    return;
+  }
+
+  Serial.printf(
+    "\nSe encontraron %d posibles QR en el frame.\n",
+    qrCount
+  );
+
+  for (int i = 0; i < qrCount; i++) {
+    struct quirc_code code;
+    struct quirc_data data;
+
+    quirc_extract(qrScanner, i, &code);
+
+    quirc_decode_error_t decodeResult = quirc_decode(&code, &data);
+
+    /*
+      Si la cámara entrega la imagen espejada, se prueba
+      nuevamente invirtiendo la matriz del QR.
+    */
+    
+
+    if (decodeResult == QUIRC_SUCCESS) {
+      printQRData(data, i);
+    } else {
+      Serial.printf(
+        "QR encontrado, pero no se pudo decodificar: %s\n",
+        quirc_strerror(decodeResult)
+      );
+    }
+  }
+}
+
+// =====================================================
+// Setup
+// =====================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(1500);
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("PRUEBA ESP32-CAM + QUIRC");
+  Serial.println("Sin pantalla TFT");
+  Serial.println("========================================");
+
+  Serial.printf(
+    "PSRAM detectada: %s\n",
+    psramFound() ? "SI" : "NO"
+  );
+
+  Serial.printf(
+    "Heap libre al iniciar: %u bytes\n",
+    ESP.getFreeHeap()
+  );
+
+  Serial.printf(
+    "PSRAM total: %u bytes\n",
+    ESP.getPsramSize()
+  );
+
+  Serial.printf(
+    "PSRAM libre: %u bytes\n",
+    ESP.getFreePsram()
+  );
+
+  qrScanner = quirc_new();
+
+  if (qrScanner == nullptr) {
+    Serial.println("ERROR CRITICO: quirc_new fallo.");
+    Serial.println("No se pudo crear el lector QR.");
+
+    while (true) {
+      delay(1000);
     }
   }
 
-  esp_camera_fb_return(fb);
+  Serial.println("Objeto quirc creado correctamente.");
+
+  if (!setupCamera()) {
+    Serial.println("No se puede continuar sin camara.");
+
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  Serial.println();
+  Serial.println("Sistema preparado.");
+  Serial.println("Coloque un codigo QR frente a la camara.");
+  Serial.println();
+}
+
+// =====================================================
+// Loop
+// =====================================================
+
+void loop() {
+  camera_fb_t *frame = esp_camera_fb_get();
+
+  if (frame == nullptr) {
+    Serial.println("ERROR: esp_camera_fb_get fallo.");
+    delay(100);
+    return;
+  }
+
+  frameCounter++;
+
+  scanFrame(frame);
+
+  /*
+    Siempre se devuelve el framebuffer después de usarlo.
+  */
+  esp_camera_fb_return(frame);
+
+  /*
+    Cada dos segundos muestra que el sistema continúa funcionando,
+    aunque todavía no haya detectado un QR.
+  */
+  if (millis() - lastStatusTime >= 2000) {
+    lastStatusTime = millis();
+
+    Serial.printf(
+      "Buscando QR... Frames: %lu | Heap: %u | PSRAM: %u\n",
+      frameCounter,
+      ESP.getFreeHeap(),
+      ESP.getFreePsram()
+    );
+  }
+
+  delay(30);
+  yield();
 }
