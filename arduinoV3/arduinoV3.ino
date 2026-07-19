@@ -30,7 +30,7 @@ uint8_t *grayscale_buf = nullptr;
 
 // Variables for Core 0 to pass data back to Core 1 safely
 volatile bool update_ui = false;
-char new_payload[64] = "";
+char new_payload[64] = "";  // initialized to avoid garbage if no QR decoded yet
 String last_painting_name = "";
 String current_painting_text = ""; 
 
@@ -50,6 +50,7 @@ void setup() {
 
   tft.init();
   tft.setRotation(2); 
+  tft.fillScreen(TFT_BLACK);
   tft.setSwapBytes(false); 
 
   // Allocate memory safely
@@ -99,11 +100,6 @@ void setup() {
   config.grab_mode = CAMERA_GRAB_LATEST;
 
   Serial.println("Initializing camera...");
-
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("Initializing camera...", 10, 110, 2);
-
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     tft.fillScreen(TFT_RED);
@@ -135,7 +131,7 @@ void loop() {
   // 2. If Core 0 is finished, give it a new frame to scan
   if (!frame_ready_for_scan && grayscale_buf) {
     for (int i = 0; i < 320 * 240; i++) {
-      uint16_t pixel = (fb->buf[i*2] << 8) | fb->buf[i*2+1]; 
+      uint16_t pixel = (fb->buf[i*2+1] << 8) | fb->buf[i*2];  // little-endian RGB565 
       
       // Extract R, G, B
       uint8_t r = (pixel >> 11) & 0x1F;
@@ -155,8 +151,8 @@ void loop() {
 
   // 3. If Core 0 successfully read a NEW QR code, update our text variable
   if (update_ui) {
-    update_ui = false; // Clear flag
-    String payload = String(new_payload);
+    String payload = String(new_payload);  // read FIRST before clearing flag
+    update_ui = false;
 
     // DEBUG: This white box at the top will show you EXACTLY what the camera read!
     tft.fillRect(0, 0, 240, 20, TFT_WHITE);
@@ -225,7 +221,7 @@ void scannerTask(void *pvParameters) {
           // Only trigger a UI update if it's a different QR code than last time
           if (payload != last_painting_name) {
             last_painting_name = payload;
-            strncpy(new_payload, (const char *)data.payload, 63);
+            strncpy(new_payload, temp_buf, 63);  // use trimmed source
             new_payload[63] = '\0'; 
             update_ui = true; 
           }
