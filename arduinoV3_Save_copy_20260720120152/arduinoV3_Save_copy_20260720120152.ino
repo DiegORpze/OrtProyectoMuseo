@@ -1,8 +1,13 @@
+// ============================================================
+// ESP32-CAM Live Video to TFT7789 Display
+// Bulk transfer - no pixel conversion - full frame push
+// ============================================================
+
 #include "esp_camera.h"
 #include <SPI.h>
 #include <TFT_eSPI.h>
-#include <quirc.h>
 
+// ------------------- CAMERA PIN DEFINITIONS -------------------
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
@@ -20,59 +25,120 @@
 #define HREF_GPIO_NUM     23
 #define PCLK_GPIO_NUM     22
 
+// ------------------- DISPLAY OBJECTS -------------------------
 TFT_eSPI tft = TFT_eSPI();
 
-struct quirc *qr = nullptr;
+// Frame dimensions
+// Camera always captures 320 wide x 240 tall in QVGA mode
+// Display is 240 x 240, so we crop 40 pixels from each side of the camera frame
+#define CAM_WIDTH   320
+#define CAM_HEIGHT  240
+#define DISP_SIZE   240   // square display
+#define CROP_OFFSET 40    // columns to skip from left (center crop)
 
-// Shared variables between cores
-volatile bool frame_ready_for_scan = false;
-uint8_t *grayscale_buf = nullptr; 
+// PSRAM frame buffer for bulk transfer
+// We allocate a 240x240 buffer in PSRAM - one properly cropped frame
+static uint16_t* frameBuffer = nullptr;
 
-// Variables for Core 0 to pass data back to Core 1 safely
-volatile bool update_ui = false;
-char new_payload[64] = "";
-String last_painting_name = "";
-String current_painting_text = ""; 
+// Debug stage tracking
+enum DebugStage {
+  STAGE_INIT,
+  STAGE_PSRAM_ALLOC,
+  STAGE_CAMERA_INIT,
+  STAGE_TFT_INIT,
+  STAGE_STREAMING
+};
 
-// Task handle for Core 0
-TaskHandle_t Task0;
+// FPS tracking
+uint32_t frameCount = 0;
+uint32_t fpsLastTime = 0;
+uint32_t currentFps = 0;
 
-void setup() {
-  Serial.begin(230400);
-  delay(1000);
-
-  // Manual reset
-  pinMode(12, OUTPUT);
-  digitalWrite(12, LOW);
-  delay(50);
-  digitalWrite(12, HIGH);
-  delay(150);
-
-  tft.init();
-  tft.setRotation(2); 
+// ============================================================
+// DEBUG: Draw debug screen with stage info and optional message
+// ============================================================
+void showDebugScreen(const char* stage, const char* msg = nullptr) {
   tft.fillScreen(TFT_BLACK);
-  tft.setSwapBytes(false); 
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(5, 5);
+  tft.print("== DEBUG ==");
 
-  // Allocate memory safely
-  if(ESP.getPsramSize() > 0) {
-    grayscale_buf = (uint8_t *)ps_malloc(320 * 240);
-  } else {
-    grayscale_buf = (uint8_t *)malloc(320 * 240);
-  }
-  
-  if (!grayscale_buf) {
-    Serial.println("Failed to allocate grayscale buffer!");
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setTextSize(2);
+  tft.setCursor(5, 40);
+  tft.print(stage);
+
+  if (msg) {
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.setTextSize(2);
+    tft.setCursor(5, 80);
+    tft.print(msg);
   }
 
-  // Initialize QR Decoder
-  qr = quirc_new();
-  if (!qr) {
-    Serial.println("Failed to allocate quirc memory");
-  } else {
-    if (quirc_resize(qr, 320, 240) < 0) {
-      Serial.println("Failed to resize quirc");
-    }
+  // Small spinner dots to show it's not frozen
+  static uint8_t dotCount = 0;
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setCursor(5, 200);
+  for (uint8_t i = 0; i < dotCount % 4; i++) tft.print(".");
+  dotCount++;
+}
+
+// ============================================================
+// Show error screen and halt
+// ============================================================
+void showError(const char* stage, const char* msg) {
+  tft.fillScreen(TFT_RED);
+  tft.setTextColor(TFT_WHITE, TFT_RED);
+  tft.setTextSize(2);
+  tft.setCursor(5, 5);
+  tft.print("ERROR:");
+  tft.setCursor(5, 40);
+  tft.print(stage);
+  tft.setCursor(5, 80);
+  tft.print(msg);
+
+  // Freeze
+  while (1) { delay(1000); }
+}
+
+// ============================================================
+// SETUP
+// ============================================================
+void setup() {
+  // ---- STAGE 0: INIT ----
+  // TFT init first so we can show debug
+  tft.init();
+  tft.setRotation(3);           // Rotation 3 as requested
+  tft.setSwapBytes(false);      // No byte swap - direct RGB565 push
+  tft.fillScreen(TFT_BLACK);
+
+  showDebugScreen("0_INIT", "Starting up...");
+  delay(500);
+
+  // ---- STAGE 1: PSRAM ALLOCATION ----
+  showDebugScreen("1_PSRAM", "Allocating buffer...");
+
+  if (ESP.getPsramSize() == 0) {
+    showError("1_PSRAM", "NO PSRAM FOUND!");
   }
+
+  uint32_t psramFree = ESP.getFreePsram();
+  char buf[30];
+  snprintf(buf, sizeof(buf), "PSRAM: %u KB free", psramFree / 1024);
+  showDebugScreen("1_PSRAM", buf);
+  delay(500);
+
+  // Allocate 240x240x2 = 115,200 bytes in PSRAM for one cropped frame
+  frameBuffer = (uint16_t*)ps_malloc(DISP_SIZE * DISP_SIZE * sizeof(uint16_t));
+  if (!frameBuffer) {
+    showError("1_PSRAM", "Buffer alloc failed!");
+  }
+  showDebugScreen("1_PSRAM", "Buffer OK!");
+  delay(500);
+
+  // ---- STAGE 2: CAMERA INIT ----
+  showDebugScreen("2_CAMERA", "Configuring camera...");
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -93,145 +159,82 @@ void setup() {
   config.pin_pclk = PCLK_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000; 
-  config.pixel_format = PIXFORMAT_RGB565; 
-  config.frame_size = FRAMESIZE_QVGA;
-  config.fb_count = 2; 
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_RGB565;
+  config.frame_size = FRAMESIZE_QVGA;   // 320x240
+  config.fb_count = 2;
   config.grab_mode = CAMERA_GRAB_LATEST;
 
-  Serial.println("Initializing camera...");
+  showDebugScreen("2_CAMERA", "Calling init...");
+  delay(200);
+
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
+    snprintf(buf, sizeof(buf), "Err: 0x%x", err);
+    showError("2_CAMERA", buf);
+  }
+  showDebugScreen("2_CAMERA", "Camera OK!");
+  delay(500);
+
+  // ---- STAGE 3: TFT INIT ----
+  showDebugScreen("3_TFT", "TFT ready");
+  snprintf(buf, sizeof(buf), "TFT: %dx%d rot3", tft.width(), tft.height());
+  showDebugScreen("3_TFT", buf);
+  delay(500);
+
+  // ---- STAGE 4: START STREAMING ----
+  showDebugScreen("4_STREAM", "Starting stream...");
+  delay(1000);
+
+  // Black fill before streaming begins
+  tft.fillScreen(TFT_BLACK);
+
+  fpsLastTime = millis();
+  frameCount = 0;
+
+  showDebugScreen("4_STREAM", "GO!");
+  delay(500);
+}
+
+// ============================================================
+// Main display loop
+// ============================================================
+void loop() {
+  // Capture frame
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) {
     tft.fillScreen(TFT_RED);
-    tft.drawString("Cam Error", 10, 10, 2);
-    Serial.printf("Error: 0x%x\n", err);
+    tft.setTextColor(TFT_WHITE, TFT_RED);
+    tft.setTextSize(2);
+    tft.setCursor(10, 100);
+    tft.print("NO FRAME!");
+    delay(100);
     return;
   }
 
-  // Start Core 0 task
-  xTaskCreatePinnedToCore(
-    scannerTask,   
-    "Scanner",     
-    10000,         
-    NULL,          
-    1,             
-    &Task0,        
-    0              
-  );
-}
-
-// ------------------- CORE 1: VIDEO & UI LOOP -------------------
-void loop() {
-  camera_fb_t * fb = esp_camera_fb_get();
-  if (!fb) return;
-
-  // 1. Draw the live video to the screen immediately
-  tft.pushImage(0, 0, fb->width, fb->height, (uint16_t *)fb->buf);
-
-  // 2. If Core 0 is finished, give it a new frame to scan
-  if (!frame_ready_for_scan && grayscale_buf) {
-    for (int i = 0; i < 320 * 240; i++) {
-      uint16_t pixel = (fb->buf[i*2] << 8) | fb->buf[i*2+1]; 
-      
-      // Extract R, G, B
-      uint8_t r = (pixel >> 11) & 0x1F;
-      uint8_t g = (pixel >> 5) & 0x3F;
-      uint8_t b = pixel & 0x1F;
-      
-      // FIX: Properly scale 5-bit/6-bit values to 8-bit (0-255) before applying luminance formula
-      r = (r << 3) | (r >> 2);
-      g = (g << 2) | (g >> 4);
-      b = (b << 3) | (b >> 2);
-      
-      // Standard luminance formula (Y = 0.299R + 0.587G + 0.114B)
-      grayscale_buf[i] = (r * 77 + g * 150 + b * 29) >> 8; 
-    }
-    frame_ready_for_scan = true;
+  // Copy frame to PSRAM buffer for bulk transfer
+  // fb->buf is already RGB565, frameBuffer is RGB565 - no conversion needed
+  // We crop to 240x240 by skipping the first 40 pixels of each row (center crop)
+  uint16_t* dst = frameBuffer;
+  uint16_t* src = (uint16_t*)fb->buf + CROP_OFFSET;
+  for (int row = 0; row < DISP_SIZE; row++) {
+    memcpy(dst, src, DISP_SIZE * 2);  // 240 pixels x 2 bytes = 480 bytes per row
+    dst += DISP_SIZE;
+    src += CAM_WIDTH;
   }
 
-  // 3. If Core 0 successfully read a NEW QR code, update our text variable
-  if (update_ui) {
-    update_ui = false; // Clear flag
-    String payload = String(new_payload);
-
-    // DEBUG: This white box at the top will show you EXACTLY what the camera read!
-    tft.fillRect(0, 0, 240, 20, TFT_WHITE);
-    tft.setTextColor(TFT_BLACK, TFT_WHITE);
-    tft.drawString("Raw: " + payload, 2, 2, 2);
-    
-    // --- MUSEUM LOGIC HERE ---
-    if (payload == "MonaLisa") {
-      current_painting_text = "Painting: Mona Lisa";
-    }
-    else if (payload == "StarryNight") {
-      current_painting_text = "Painting: Starry Night";
-    }
-    else if (payload == "TheScream") {
-      current_painting_text = "Painting: The Scream";
-    }
-    else {
-      // If it reads a QR code you didn't program, show the raw text
-      current_painting_text = "Read: " + payload;
-    }
-  }
-
-  // 4. Draw the text box EVERY FRAME so the video doesn't erase it
-  if (current_painting_text != "") {
-    tft.fillRect(0, 210, 240, 30, TFT_BLUE); // Background box
-    tft.setTextColor(TFT_WHITE, TFT_BLUE);
-    tft.drawString(current_painting_text, 5, 215, 2);
-  }
-
+  // Return frame buffer to camera immediately so it can capture next frame
   esp_camera_fb_return(fb);
-}
 
-// ------------------- CORE 0: QR SCANNER LOOP -------------------
-void scannerTask(void *pvParameters) {
-  for (;;) {
-    // Wait until Core 1 gives us a new frame to scan
-    if (frame_ready_for_scan) {
-      
-      int w = 0, h = 0;
-      uint8_t *qbuf = quirc_begin(qr, &w, &h);
-      
-      if (qbuf) {
-        memcpy(qbuf, grayscale_buf, w * h);
-      }
-      quirc_end(qr);
+  // Bulk push 240x240 to TFT - single DMA transfer
+  tft.pushImage(0, 0, DISP_SIZE, DISP_SIZE, frameBuffer);
 
-      int count = quirc_count(qr);
-      if (count > 0) {
-        struct quirc_code code;
-        struct quirc_data data;
-        quirc_extract(qr, 0, &code);
-        
-        if (quirc_decode(&code, &data) == QUIRC_SUCCESS) {
-          // FIX: quirc doesn't null-terminate the string! We must do it manually.
-          int len = data.payload_len;
-          if (len > 63) len = 63; // Prevent overflow
-          
-          char temp_buf[64];
-          memcpy(temp_buf, data.payload, len);
-          temp_buf[len] = '\0'; // Add the missing null terminator!
-          
-          // Convert to String and remove any accidental spaces/newlines
-          String payload = String(temp_buf);
-          payload.trim(); 
-          
-          // Only trigger a UI update if it's a different QR code than last time
-          if (payload != last_painting_name) {
-            last_painting_name = payload;
-            strncpy(new_payload, (const char *)data.payload, 63);
-            new_payload[63] = '\0'; 
-            update_ui = true; 
-          }
-        }
-      }
-      // Tell Core 1 we are done and ready for the next frame
-      frame_ready_for_scan = false;
-    } else {
-      // Yield to prevent hogging the CPU
-      vTaskDelay(10 / portTICK_PERIOD_MS);
-    }
+  // FPS counter - update every second
+  frameCount++;
+  uint32_t now = millis();
+  if (now - fpsLastTime >= 1000) {
+    currentFps = frameCount;
+    frameCount = 0;
+    fpsLastTime = now;
   }
 }
