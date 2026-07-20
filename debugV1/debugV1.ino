@@ -41,6 +41,16 @@ void setup() {
   Serial.begin(115200);
   delay(1500);
 
+  Serial.println("Iniciando...");
+
+  // Check PSRAM
+  if (!psramFound()) {
+    Serial.println("ERROR: No se detecto PSRAM.");
+    // Can't show on TFT yet
+    while (true) delay(1000);
+  }
+  Serial.println("PSRAM detectada.");
+
   // CAMERA POWER-ON SEQUENCE FOR ESP32-CAM AI-THINKER
   // GPIO 32 is PWDN for the camera
   pinMode(32, OUTPUT);
@@ -51,9 +61,42 @@ void setup() {
   Serial.println("Camera PWDN sequence done.");
 
   // Initialize camera
+  Serial.println("Inicializando camara...");
   lectorQR.setDebug(false);
 
-  QRCodeReaderSetupErr resultado = lectorQR.setup();  
+  QRCodeReaderSetupErr resultado = lectorQR.setup();
+  Serial.println("Setup() retorno.");
+
+  if (resultado == SETUP_NO_PSRAM_ERROR) {
+    Serial.println("ERROR: La biblioteca no encontro PSRAM.");
+    while (true) delay(1000);
+  }
+
+  if (resultado == SETUP_CAMERA_INIT_ERROR) {
+    Serial.println("ERROR: No se pudo inicializar la camara.");
+    while (true) delay(1000);
+  }
+
+  if (resultado != SETUP_OK) {
+    Serial.println("ERROR: Error desconocido al iniciar el lector.");
+    while (true) delay(1000);
+  }
+
+  Serial.println("Configurando sensor...");
+
+  // Get sensor and configure mirror
+  sensor_t *sensor = esp_camera_sensor_get();
+  if (sensor == nullptr) {
+    Serial.println("ERROR: No se pudo obtener el sensor.");
+    while (true) delay(1000);
+  }
+
+  int resultadoEspejo = sensor->set_hmirror(sensor, 1);
+  if (resultadoEspejo == 0) {
+    Serial.println("Imagen invertida OK.");
+  } else {
+    Serial.println("Error al invertir imagen.");
+  }
 
   delay(1000);
   lectorQR.beginOnCore(1);
@@ -64,6 +107,7 @@ void setup() {
   // ============================================
   tft.init();
   tft.setRotation(1);  // Landscape orientation for 320x240
+  tft.setRotation(3);  // Landscape orientation for 320x240
   tft.fillScreen(TFT_BLACK);
 
   // Set default font and colors
@@ -75,31 +119,34 @@ void setup() {
   // STEP 3: Display status messages on TFT
   // ============================================
 
-  // Welcome screen - centered for rotation 3
+  // Welcome screen
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextDatum(TC_DATUM);
-  tft.drawString("PRUEBA DE LECTURA", 160, 170, 2);
-  tft.drawString("DE CODIGOS QR", 160, 200, 2);
+  tft.drawString("PRUEBA DE LECTURA", 160, 80, 2);
+  tft.drawString("DE CODIGOS QR", 160, 110, 2);
   delay(2000);
   tft.fillScreen(TFT_BLACK);
 
-  // Show PSRAM status - centered for rotation 3
-  tft.setTextDatum(TC_DATUM);
-  tft.drawString("PSRAM detectada.", 160, 200, 2);
+  // Show PSRAM status
+  tft.setTextDatum(TL_DATUM);
+  tft.setCursor(10, 10);
+  tft.println("PSRAM detectada.");
   delay(500);
 
-  tft.drawString("Camara inicializada", 160, 140, 2);
-  tft.drawString("correctamente.", 160, 170, 2);
+  tft.setCursor(10, 30);
+  tft.println("Camara inicializada");
+  tft.setCursor(10, 48);
+  tft.println("correctamente.");
   delay(1000);
 
-  // Final ready screen - centered for rotation 3
+  // Final ready screen
   tft.fillScreen(TFT_BLACK);
   tft.setTextDatum(TC_DATUM);
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.drawString("Lector QR preparado.", 160, 120, 2);
+  tft.drawString("Lector QR preparado.", 160, 90, 2);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("Coloque un codigo QR", 160, 140, 2);
-  tft.drawString("frente a la camara.", 160, 170, 2);
+  tft.drawString("Coloque un codigo QR", 160, 130, 2);
+  tft.drawString("frente a la camara.", 160, 150, 2);
 }
 
 void loop() {
@@ -109,21 +156,23 @@ void loop() {
   if (lectorQR.receiveQrCode(&datosQR, 100)) {
     tft.fillScreen(TFT_BLACK);
     tft.setFreeFont(&FreeMono9pt7b);
+    tft.setTextDatum(TL_DATUM);
 
-    /* Draw a border - centered for rotation 3
+    // Draw a border
     tft.drawRect(2, 2, 316, 236, TFT_WHITE);
-    tft.drawLine(10, 30, 310, 30, TFT_WHITE);*/
+    tft.drawLine(10, 28, 310, 28, TFT_WHITE);
 
     if (datosQR.valid) {
-      // QR Content header - centered
+      // QR Content header
       tft.setTextColor(TFT_GREEN, TFT_BLACK);
       tft.setTextDatum(TC_DATUM);
-      tft.drawString("QR DETECTADO", 160, 200, 2);
+      tft.drawString("QR DETECTADO", 160, 8, 2);
 
-      // Content label - left aligned for readability
       tft.setTextColor(TFT_WHITE, TFT_BLACK);
       tft.setTextDatum(TL_DATUM);
-      tft.setCursor(15, 180);
+
+      // Show "CONTENIDO:"
+      tft.setCursor(15, 40);
       tft.print("CONTENIDO: ");
 
       // Print the QR payload bytes in yellow
@@ -134,16 +183,17 @@ void loop() {
 
       // Show length in white
       tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.drawString("Longitud: ", 160, 140, 2);
+      tft.setCursor(15, 68);
+      tft.print("Longitud: ");
       tft.print(datosQR.payloadLen);
       tft.print(" bytes");
 
-      /* Draw separator
-      tft.drawLine(10, 130, 310, 130, TFT_WHITE);*/
+      // Draw separator
+      tft.drawLine(10, 95, 310, 95, TFT_WHITE);
 
       // Show raw payload in cyan
       tft.setTextColor(TFT_CYAN, TFT_BLACK);
-      tft.setCursor(2, 160);
+      tft.setCursor(15, 108);
       tft.print("[");
       for (size_t i = 0; i < datosQR.payloadLen; i++) {
         tft.print((char)datosQR.payload[i]);
@@ -151,15 +201,17 @@ void loop() {
       tft.print("]");
 
     } else {
-      // Invalid QR found - centered
+      // Invalid QR found
       tft.setTextColor(TFT_ORANGE, TFT_BLACK);
       tft.setTextDatum(TC_DATUM);
-      tft.drawString("POSIBLE QR", 160, 200, 2);
+      tft.drawString("POSIBLE QR", 160, 8, 2);
 
       tft.setTextColor(TFT_WHITE, TFT_BLACK);
       tft.setTextDatum(TL_DATUM);
-      tft.drawString("Se encontro un posible QR,", 120, 140, 2);
-      tft.drawString("pero no pudo decodificarse.", 120, 160, 2);
+      tft.setCursor(15, 45);
+      tft.println("Se encontro un posible QR,");
+      tft.setCursor(15, 63);
+      tft.println("pero no pudo decodificarse.");
     }
 
     // Delay before next scan
