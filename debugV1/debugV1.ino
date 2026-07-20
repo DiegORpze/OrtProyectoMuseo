@@ -10,12 +10,14 @@ TFT_eSPI tft = TFT_eSPI();
 
 ESP32QRCodeReader lectorQR(
   CAMERA_MODEL_AI_THINKER,
-  FRAMESIZE_QVGA
-);
+  FRAMESIZE_QVGA);
 
 // Guarda el último QR mostrado para no redibujarlo continuamente.
 String ultimoTextoMostrado = "";
+unsigned long ultimaDeteccionQR = 0;
+const unsigned long TIEMPO_SIN_QR = 1500;
 
+bool hayTextoEnPantalla = false;
 
 // =====================================================
 // DETENER EL PROGRAMA ANTE UN ERROR CRÍTICO
@@ -75,10 +77,7 @@ String obtenerTextoQR(const QRCodeData& datosQR) {
       MonaLisa\n
     */
     if (
-      caracter == '\n' ||
-      caracter == '\r' ||
-      caracter == '\t'
-    ) {
+      caracter == '\n' || caracter == '\r' || caracter == '\t') {
       espacioPendiente = true;
       continue;
     }
@@ -139,8 +138,7 @@ void mostrarTextoQR(const String& texto) {
       texto,
       tft.width() / 2,
       tft.height() / 2,
-      fuente
-    );
+      fuente);
 
     return;
   }
@@ -279,54 +277,29 @@ void setup() {
 // =====================================================
 
 void loop() {
-  /*
-    Inicializar en cero evita conservar información
-    residual entre una lectura y otra.
-  */
   QRCodeData datosQR = {};
 
-  /*
-    Espera hasta 100 ms por un resultado de la tarea
-    de lectura QR.
-  */
   if (lectorQR.receiveQrCode(&datosQR, 100)) {
 
-    /*
-      Las detecciones inválidas se ignoran completamente.
+    if (datosQR.valid) {
+      String textoQR = obtenerTextoQR(datosQR);
 
-      No borran la pantalla.
-      No muestran mensajes.
-      No intentan imprimir el payload del error.
-    */
-    if (!datosQR.valid) {
-      delay(10);
-      return;
+      if (textoQR.length() > 0) {
+        ultimaDeteccionQR = millis();
+
+        if (textoQR != ultimoTextoMostrado || !hayTextoEnPantalla) {
+          ultimoTextoMostrado = textoQR;
+          mostrarTextoQR(textoQR);
+          hayTextoEnPantalla = true;
+        }
+      }
     }
+  }
 
-    String textoQR = obtenerTextoQR(datosQR);
-
-    // Ignorar textos vacíos.
-    if (textoQR.length() == 0) {
-      delay(10);
-      return;
-    }
-
-    /*
-      No redibujar el mismo contenido constantemente
-      mientras el QR continúa frente a la cámara.
-    */
-    if (textoQR == ultimoTextoMostrado) {
-      delay(10);
-      return;
-    }
-
-    ultimoTextoMostrado = textoQR;
-
-    /*
-      Mostrar únicamente el contenido del QR.
-      Ejemplo: MonaLisa
-    */
-    mostrarTextoQR(textoQR);
+  if (hayTextoEnPantalla && millis() - ultimaDeteccionQR >= TIEMPO_SIN_QR) {
+    tft.fillScreen(TFT_BLACK);
+    hayTextoEnPantalla = false;
+    ultimoTextoMostrado = "";
   }
 
   delay(10);
