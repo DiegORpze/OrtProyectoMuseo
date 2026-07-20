@@ -214,11 +214,15 @@ void loop() {
 
   // Copy frame to PSRAM buffer for bulk transfer
   // fb->buf is already RGB565, frameBuffer is RGB565 - no conversion needed
-  // We crop to 240x240 by skipping the first 40 pixels of each row (center crop)
+  // We crop to 240x240 by taking columns 40-279 from each row (center crop)
+  // Mirror horizontally so camera-right maps to display-right (VR headset fix)
   uint16_t* dst = frameBuffer;
   uint16_t* src = (uint16_t*)fb->buf + CROP_OFFSET;
   for (int row = 0; row < DISP_SIZE; row++) {
-    memcpy(dst, src, DISP_SIZE * 2);  // 240 pixels x 2 bytes = 480 bytes per row
+    // Write pixels in reverse order to mirror horizontally
+    for (int col = 0; col < DISP_SIZE; col++) {
+      dst[DISP_SIZE - 1 - col] = src[col];
+    }
     dst += DISP_SIZE;
     src += CAM_WIDTH;
   }
