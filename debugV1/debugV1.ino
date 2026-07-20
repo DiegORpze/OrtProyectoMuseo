@@ -1,221 +1,332 @@
 #include "esp_camera.h"
 #include <ESP32QRCodeReader.h>
-#include <TFT_eSPI.h>  // TFT_eSPI library
+#include <TFT_eSPI.h>
 
-// Initialize TFT display
+// =====================================================
+// OBJETOS PRINCIPALES
+// =====================================================
+
 TFT_eSPI tft = TFT_eSPI();
 
-// ESP32-CAM modelo AI-Thinker.
-// QVGA = 320 x 240, suficiente para el test y menos exigente en memoria.
 ESP32QRCodeReader lectorQR(
   CAMERA_MODEL_AI_THINKER,
-  FRAMESIZE_QVGA);
+  FRAMESIZE_QVGA
+);
 
-// Show centered title with specific font number (font 2 = 16px height)
-void tituloCentradoFont(const char* str, int y, uint8_t font) {
-  tft.setTextDatum(TC_DATUM);
-  tft.drawString(str, 160, y, font);
-}
+// Guarda el último QR mostrado para no redibujarlo continuamente.
+String ultimoTextoMostrado = "";
 
-void mostrarError(const char* mensaje) {
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_RED, TFT_BLACK);
-  tft.setFreeFont(&FreeMono9pt7b);
-  tft.setTextDatum(TC_DATUM);
 
-  tituloCentradoFont("================================", 70, 2);
-  tituloCentradoFont("ERROR", 95, 2);
-  tituloCentradoFont(mensaje, 125, 2);
-  tituloCentradoFont("Programa detenido.", 155, 2);
-  tituloCentradoFont("================================", 185, 2);
+// =====================================================
+// DETENER EL PROGRAMA ANTE UN ERROR CRÍTICO
+// =====================================================
+
+void detenerPrograma() {
+  /*
+    No se imprime nada por el Monitor Serie.
+
+    Si ocurre un error crítico, el programa queda detenido.
+    La pantalla permanecerá negra si ya fue inicializada.
+  */
 
   while (true) {
     delay(1000);
   }
 }
 
+
+// =====================================================
+// LIMPIAR EL TEXTO RECIBIDO DESDE EL QR
+// =====================================================
+
+String obtenerTextoQR(const QRCodeData& datosQR) {
+  String texto = "";
+
+  if (datosQR.payloadLen <= 0) {
+    return texto;
+  }
+
+  /*
+    payload tiene un tamaño máximo definido por la biblioteca.
+    Se limita la longitud para evitar leer fuera del arreglo.
+  */
+  size_t longitud = (size_t)datosQR.payloadLen;
+  size_t capacidad = sizeof(datosQR.payload);
+
+  if (longitud > capacidad) {
+    longitud = capacidad;
+  }
+
+  bool espacioPendiente = false;
+
+  for (size_t i = 0; i < longitud; i++) {
+    uint8_t caracter = datosQR.payload[i];
+
+    // Fin explícito del texto.
+    if (caracter == '\0') {
+      break;
+    }
+
+    /*
+      Los saltos de línea, retornos y tabulaciones se
+      convierten en un único espacio.
+
+      Esto corrige casos como:
+      MonaLisa\n
+    */
+    if (
+      caracter == '\n' ||
+      caracter == '\r' ||
+      caracter == '\t'
+    ) {
+      espacioPendiente = true;
+      continue;
+    }
+
+    // Ignorar otros caracteres de control.
+    if (caracter < 32) {
+      continue;
+    }
+
+    if (espacioPendiente && texto.length() > 0) {
+      texto += ' ';
+    }
+
+    espacioPendiente = false;
+    texto += (char)caracter;
+  }
+
+  // Elimina espacios al principio y al final.
+  texto.trim();
+
+  return texto;
+}
+
+
+// =====================================================
+// MOSTRAR ÚNICAMENTE EL TEXTO DEL QR
+// =====================================================
+
+void mostrarTextoQR(const String& texto) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  const int margen = 10;
+  const int anchoDisponible = tft.width() - (margen * 2);
+
+  /*
+    Se comienza con una fuente grande.
+    Si el texto no entra, se reduce automáticamente.
+  */
+  uint8_t fuente = 4;
+
+  if (tft.textWidth(texto, fuente) > anchoDisponible) {
+    fuente = 2;
+  }
+
+  if (tft.textWidth(texto, fuente) > anchoDisponible) {
+    fuente = 1;
+  }
+
+  /*
+    Si entra en una sola línea, se muestra centrado
+    horizontal y verticalmente.
+  */
+  if (tft.textWidth(texto, fuente) <= anchoDisponible) {
+    tft.setTextDatum(MC_DATUM);
+
+    tft.drawString(
+      texto,
+      tft.width() / 2,
+      tft.height() / 2,
+      fuente
+    );
+
+    return;
+  }
+
+  /*
+    Si incluso con la fuente más pequeña no entra en
+    una línea, se activa el ajuste automático de texto.
+  */
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextFont(1);
+  tft.setTextWrap(true, true);
+  tft.setCursor(margen, margen, 1);
+  tft.print(texto);
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
 void setup() {
-  // ============================================
-  // STEP 1: Initialize Serial and Camera FIRST
-  // ============================================
-  Serial.begin(115200);
+  /*
+    Se conserva esta espera porque en las pruebas anteriores
+    ayudó a obtener un arranque estable.
+  */
   delay(1500);
 
-  Serial.println("Iniciando...");
+  // ---------------------------------------------------
+  // 1. Verificar PSRAM
+  // ---------------------------------------------------
 
-  // Check PSRAM
   if (!psramFound()) {
-    Serial.println("ERROR: No se detecto PSRAM.");
-    // Can't show on TFT yet
-    while (true) delay(1000);
+    detenerPrograma();
   }
-  Serial.println("PSRAM detectada.");
 
-  // CAMERA POWER-ON SEQUENCE FOR ESP32-CAM AI-THINKER
-  // GPIO 32 is PWDN for the camera
+  // ---------------------------------------------------
+  // 2. Secuencia de encendido de la cámara
+  // ---------------------------------------------------
+
+  /*
+    GPIO32 corresponde a PWDN en la ESP32-CAM AI-Thinker.
+
+    Primero se apaga la cámara y luego se vuelve a encender
+    para asegurar un inicio limpio.
+  */
   pinMode(32, OUTPUT);
-  digitalWrite(32, HIGH);  // Power down camera first
-  delay(100);
-  digitalWrite(32, LOW);   // Power up camera
-  delay(100);
-  Serial.println("Camera PWDN sequence done.");
 
-  // Initialize camera
-  Serial.println("Inicializando camara...");
+  digitalWrite(32, HIGH);
+  delay(100);
+
+  digitalWrite(32, LOW);
+  delay(100);
+
+  // ---------------------------------------------------
+  // 3. Inicializar cámara y lector QR
+  // ---------------------------------------------------
+
+  /*
+    Desactiva todos los mensajes internos de diagnóstico
+    de ESP32QRCodeReader.
+  */
   lectorQR.setDebug(false);
 
   QRCodeReaderSetupErr resultado = lectorQR.setup();
-  Serial.println("Setup() retorno.");
 
   if (resultado == SETUP_NO_PSRAM_ERROR) {
-    Serial.println("ERROR: La biblioteca no encontro PSRAM.");
-    while (true) delay(1000);
+    detenerPrograma();
   }
 
   if (resultado == SETUP_CAMERA_INIT_ERROR) {
-    Serial.println("ERROR: No se pudo inicializar la camara.");
-    while (true) delay(1000);
+    detenerPrograma();
   }
 
   if (resultado != SETUP_OK) {
-    Serial.println("ERROR: Error desconocido al iniciar el lector.");
-    while (true) delay(1000);
+    detenerPrograma();
   }
 
-  Serial.println("Configurando sensor...");
+  // ---------------------------------------------------
+  // 4. Configurar la orientación de la cámara
+  // ---------------------------------------------------
 
-  // Get sensor and configure mirror
-  sensor_t *sensor = esp_camera_sensor_get();
+  sensor_t* sensor = esp_camera_sensor_get();
+
   if (sensor == nullptr) {
-    Serial.println("ERROR: No se pudo obtener el sensor.");
-    while (true) delay(1000);
+    detenerPrograma();
   }
 
-  int resultadoEspejo = sensor->set_hmirror(sensor, 1);
-  if (resultadoEspejo == 0) {
-    Serial.println("Imagen invertida OK.");
-  } else {
-    Serial.println("Error al invertir imagen.");
-  }
+  /*
+    Esta orientación fue la que permitió decodificar
+    correctamente el QR MonaLisa.
+  */
+  sensor->set_hmirror(sensor, 1);
 
-  delay(1000);
-  lectorQR.beginOnCore(1);
-  Serial.println("Camara inicializada correctamente.");
+  // ---------------------------------------------------
+  // 5. Inicializar la pantalla TFT
+  // ---------------------------------------------------
 
-  // ============================================
-  // STEP 2: Now initialize TFT display
-  // ============================================
   tft.init();
-  tft.setRotation(1);  // Landscape orientation for 320x240
-  tft.setRotation(3);  // Landscape orientation for 320x240
+
+  /*
+    Rotación horizontal utilizada por la versión
+    que anteriormente funcionó.
+
+    Si queda invertida físicamente, cambiar 3 por 1.
+  */
+  tft.setRotation(3);
+
   tft.fillScreen(TFT_BLACK);
-
-  // Set default font and colors
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setFreeFont(&FreeMono9pt7b);
-  tft.setTextDatum(TL_DATUM);
+  tft.setTextWrap(false, false);
 
-  // ============================================
-  // STEP 3: Display status messages on TFT
-  // ============================================
+  /*
+    La pantalla queda completamente negra.
+    No se muestran mensajes de bienvenida ni de estado.
+  */
 
-  // Welcome screen
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextDatum(TC_DATUM);
-  tft.drawString("PRUEBA DE LECTURA", 160, 80, 2);
-  tft.drawString("DE CODIGOS QR", 160, 110, 2);
-  delay(2000);
-  tft.fillScreen(TFT_BLACK);
+  // ---------------------------------------------------
+  // 6. Iniciar el escaneo QR
+  // ---------------------------------------------------
 
-  // Show PSRAM status
-  tft.setTextDatum(TL_DATUM);
-  tft.setCursor(10, 10);
-  tft.println("PSRAM detectada.");
-  delay(500);
-
-  tft.setCursor(10, 30);
-  tft.println("Camara inicializada");
-  tft.setCursor(10, 48);
-  tft.println("correctamente.");
+  /*
+    Da tiempo al sensor para estabilizarse antes
+    de iniciar la tarea de escaneo.
+  */
   delay(1000);
 
-  // Final ready screen
+  lectorQR.beginOnCore(1);
+
+  // Asegurar nuevamente que la pantalla quede negra.
   tft.fillScreen(TFT_BLACK);
-  tft.setTextDatum(TC_DATUM);
-  tft.setTextColor(TFT_GREEN, TFT_BLACK);
-  tft.drawString("Lector QR preparado.", 160, 90, 2);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("Coloque un codigo QR", 160, 130, 2);
-  tft.drawString("frente a la camara.", 160, 150, 2);
 }
 
+
+// =====================================================
+// LOOP
+// =====================================================
+
 void loop() {
+  /*
+    Inicializar en cero evita conservar información
+    residual entre una lectura y otra.
+  */
   QRCodeData datosQR = {};
 
-  // Check for QR code with 100ms timeout
+  /*
+    Espera hasta 100 ms por un resultado de la tarea
+    de lectura QR.
+  */
   if (lectorQR.receiveQrCode(&datosQR, 100)) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setFreeFont(&FreeMono9pt7b);
-    tft.setTextDatum(TL_DATUM);
 
-    // Draw a border
-    tft.drawRect(2, 2, 316, 236, TFT_WHITE);
-    tft.drawLine(10, 28, 310, 28, TFT_WHITE);
+    /*
+      Las detecciones inválidas se ignoran completamente.
 
-    if (datosQR.valid) {
-      // QR Content header
-      tft.setTextColor(TFT_GREEN, TFT_BLACK);
-      tft.setTextDatum(TC_DATUM);
-      tft.drawString("QR DETECTADO", 160, 8, 2);
-
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.setTextDatum(TL_DATUM);
-
-      // Show "CONTENIDO:"
-      tft.setCursor(15, 40);
-      tft.print("CONTENIDO: ");
-
-      // Print the QR payload bytes in yellow
-      tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-      for (size_t i = 0; i < datosQR.payloadLen; i++) {
-        tft.print((char)datosQR.payload[i]);
-      }
-
-      // Show length in white
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.setCursor(15, 68);
-      tft.print("Longitud: ");
-      tft.print(datosQR.payloadLen);
-      tft.print(" bytes");
-
-      // Draw separator
-      tft.drawLine(10, 95, 310, 95, TFT_WHITE);
-
-      // Show raw payload in cyan
-      tft.setTextColor(TFT_CYAN, TFT_BLACK);
-      tft.setCursor(15, 108);
-      tft.print("[");
-      for (size_t i = 0; i < datosQR.payloadLen; i++) {
-        tft.print((char)datosQR.payload[i]);
-      }
-      tft.print("]");
-
-    } else {
-      // Invalid QR found
-      tft.setTextColor(TFT_ORANGE, TFT_BLACK);
-      tft.setTextDatum(TC_DATUM);
-      tft.drawString("POSIBLE QR", 160, 8, 2);
-
-      tft.setTextColor(TFT_WHITE, TFT_BLACK);
-      tft.setTextDatum(TL_DATUM);
-      tft.setCursor(15, 45);
-      tft.println("Se encontro un posible QR,");
-      tft.setCursor(15, 63);
-      tft.println("pero no pudo decodificarse.");
+      No borran la pantalla.
+      No muestran mensajes.
+      No intentan imprimir el payload del error.
+    */
+    if (!datosQR.valid) {
+      delay(10);
+      return;
     }
 
-    // Delay before next scan
-    delay(1000);
+    String textoQR = obtenerTextoQR(datosQR);
+
+    // Ignorar textos vacíos.
+    if (textoQR.length() == 0) {
+      delay(10);
+      return;
+    }
+
+    /*
+      No redibujar el mismo contenido constantemente
+      mientras el QR continúa frente a la cámara.
+    */
+    if (textoQR == ultimoTextoMostrado) {
+      delay(10);
+      return;
+    }
+
+    ultimoTextoMostrado = textoQR;
+
+    /*
+      Mostrar únicamente el contenido del QR.
+      Ejemplo: MonaLisa
+    */
+    mostrarTextoQR(textoQR);
   }
 
   delay(10);
